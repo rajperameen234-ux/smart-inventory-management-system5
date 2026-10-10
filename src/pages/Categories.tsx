@@ -1,5 +1,42 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { supabase } from "../supabase";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { insertOwned, supabase } from "../supabase";
+import { useToast } from "../components/Toast";
+import {
+  AlertIcon,
+  LayersIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshIcon,
+  TagIcon,
+  TrashIcon,
+} from "../components/Icon";
+import {
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  ConfirmDialog,
+  EmptyState,
+  Field,
+  Input,
+  Modal,
+  PageHeader,
+  PageStack,
+  SearchInput,
+  StatCard,
+  Textarea,
+} from "../components/ui";
+import { formatNumber, toNumber } from "../lib/format";
+import {
+  findDuplicateCategory,
+  normalizeCategoryName,
+  type CategoryRecord,
+} from "../lib/categories";
+import {
+  invalidateCategories,
+  loadCategories as loadCategoriesStore,
+  subscribeCategories,
+} from "../lib/categoryStore";
 
 type Category = {
   id: number;
@@ -7,44 +44,77 @@ type Category = {
   description: string;
 };
 
-function Categories() {
+const CATEGORY_TINTS = ["", "is-pink", "is-sky", "is-mint"];
+
+export default function Categories() {
+  const toast = useToast();
+
   const [categories, setCategories] = useState<Category[]>([]);
+  const [search, setSearch] = useState("");
 
   const [showForm, setShowForm] = useState(false);
-  const [editingId, setEditingId] =
-    useState<number | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const [pendingDelete, setPendingDelete] = useState<Category | null>(null);
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
 
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
-  // LOAD CATEGORIES FROM SUPABASE
-  const loadCategories = async () => {
+  /**
+   * Reads through the shared category store so this screen and the Products
+   * dropdown always see the same list.
+   */
+  const loadCategories = async (force = false) => {
     setLoading(true);
+    setError("");
 
-    const { data, error } = await supabase
-      .from("categories")
-      .select("*")
-      .order("id", { ascending: true });
+    try {
+      const rows = await loadCategoriesStore({ force });
 
-    if (error) {
-      console.error("Load Categories Error:", error);
-      alert("Failed to load categories from database.");
+      setCategories(
+        rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          description: row.description,
+        }))
+      );
+
+      setError("");
+    } catch (caught) {
+      const message =
+        caught instanceof Error ? caught.message : "Could not load categories.";
+
+      console.error("Load Categories Error:", caught);
+      setError(message);
+      toast.error("Could not load categories", message);
+    } finally {
       setLoading(false);
-      return;
     }
-
-    setCategories(data || []);
-    setLoading(false);
   };
 
-  // LOAD WHEN PAGE OPENS
   useEffect(() => {
-    loadCategories();
+    let active = true;
+
+    void (async () => {
+      if (!active) return;
+      await loadCategories();
+    })();
+
+    // Keep in step with any other screen that changes categories.
+    const unsubscribe = subscribeCategories(() => {
+      if (active) void loadCategories();
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
-  // ADD CATEGORY FORM
   const openAddForm = () => {
     setEditingId(null);
     setName("");
@@ -52,7 +122,6 @@ function Categories() {
     setShowForm(true);
   };
 
-  // EDIT CATEGORY FORM
   const openEditForm = (category: Category) => {
     setEditingId(category.id);
     setName(category.name);
@@ -60,292 +129,360 @@ function Categories() {
     setShowForm(true);
   };
 
-  // CLOSE FORM
   const closeForm = () => {
     setShowForm(false);
     setEditingId(null);
-    setName("");
-    setDescription("");
+    setSaving(false);
   };
 
-  // SAVE / UPDATE CATEGORY
-  const saveCategory = async (e: FormEvent) => {
-    e.preventDefault();
+  const saveCategory = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
 
-    if (!name.trim()) {
-      alert("Please enter category name.");
+    const cleanName = normalizeCategoryName(name);
+
+    if (!cleanName) {
+      toast.error("Name required", "Please enter a category name.");
       return;
     }
 
-    // UPDATE
-    if (editingId !== null) {
-      const { error } = await supabase
-        .from("categories")
-        .update({
-          name: name.trim(),
-          description: description.trim(),
-        })
-        .eq("id", editingId);
+    if (saving) return;
 
-      if (error) {
-        console.error("Update Category Error:", error);
-        alert("Failed to update category.");
+    /**
+     * Duplicates would appear twice in the Products dropdown. Checked
+     * case-insensitively against what is already saved, ignoring the record
+     * currently being edited so re-saving an unchanged name is allowed.
+     */
+    const existing = categories.map(
+      (item) => ({ id: item.id, name: item.name }) as CategoryRecord
+    );
+
+    const duplicate = findDuplicateCategory(existing, cleanName, editingId);
+
+    if (duplicate) {
+      toast.error(
+        "Duplicate category",
+        `"${duplicate.name}" already exists. Choose a different name.`
+      );
+      return;
+    }
+
+    setSaving(true);
+
+    const categoryData = {
+      name: cleanName,
+      description: description.trim(),
+    };
+
+    if (editingId !== null) {
+      const { data: updatedRows, error: updateError } = await supabase
+        .from("categories")
+        .update(categoryData)
+        .eq("id", editingId)
+        .select("id, name, description");
+
+      if (updateError) {
+        console.error("Update Category Error:", updateError);
+        toast.error("Could not update category", updateError.message);
+        setSaving(false);
         return;
       }
 
-      setCategories((currentCategories) =>
-        currentCategories.map((category) =>
+      if (!updatedRows || updatedRows.length === 0) {
+        toast.error(
+          "Category was not saved",
+          "No matching row was updated. It may have been deleted, or your account may not have permission to edit it."
+        );
+        setSaving(false);
+        return;
+      }
+
+      setCategories((current) =>
+        current.map((category) =>
           category.id === editingId
-            ? {
-                ...category,
-                name: name.trim(),
-                description: description.trim(),
-              }
+            ? { ...category, ...categoryData }
             : category
         )
       );
 
-      alert("Category updated successfully!");
+      toast.success("Category updated", categoryData.name);
     } else {
-      // ADD
-      const { data, error } = await supabase
-        .from("categories")
-        .insert([
-          {
-            name: name.trim(),
-            description: description.trim(),
-          },
-        ])
-        .select()
-        .single();
+      const { data, error: insertError } = await insertOwned("categories", [
+        categoryData,
+      ]);
 
-      if (error) {
-        console.error("Add Category Error:", error);
-        alert("Failed to add category.");
+      if (insertError) {
+        console.error("Add Category Error:", insertError);
+
+        // A unique index would surface here as a constraint violation.
+        toast.error("Could not add category", insertError.message);
+        setSaving(false);
         return;
       }
 
-      setCategories((currentCategories) => [
-        ...currentCategories,
-        data,
-      ]);
+      // Never push a null row into local state if the insert returned nothing.
+      const row = (data ?? categoryData) as Category;
 
-      alert("Category added successfully!");
+      setCategories((current) => [
+        ...current,
+        { ...row, id: toNumber(row.id), name: normalizeCategoryName(row.name) },
+      ]);
+      toast.success("Category added", categoryData.name);
     }
+
+    // Publish the change so an open Products form picks it up immediately.
+    invalidateCategories();
 
     closeForm();
   };
 
-  // DELETE CATEGORY
-  const deleteCategory = async (id: number) => {
-    if (
-      !window.confirm(
-        "Are you sure you want to delete this category?"
-      )
-    ) {
-      return;
-    }
+  const deleteCategory = async (category: Category) => {
+    setSaving(true);
 
-    const { error } = await supabase
+    const { error: deleteError } = await supabase
       .from("categories")
       .delete()
-      .eq("id", id);
+      .eq("id", category.id)
+      .select("id");
 
-    if (error) {
-      console.error("Delete Category Error:", error);
-      alert(
-        "Failed to delete category. It may be linked with products."
+    setSaving(false);
+    setPendingDelete(null);
+
+    if (deleteError) {
+      console.error("Delete Category Error:", deleteError);
+      toast.error(
+        "Could not delete category",
+        "It may be linked with products."
       );
       return;
     }
 
-    setCategories((currentCategories) =>
-      currentCategories.filter(
-        (category) => category.id !== id
-      )
+setCategories((current) =>
+      current.filter((category) => category.id !== category.id)
     );
 
-    alert("Category deleted successfully!");
+    // Tell the Products dropdown this option is gone.
+    invalidateCategories();
+
+    toast.success("Category deleted", category.name);
   };
 
+  const filtered = useMemo(() => {
+    const term = search.toLowerCase().trim();
+
+    if (!term) return categories;
+
+    return categories.filter(
+      (category) =>
+        category.name.toLowerCase().includes(term) ||
+        (category.description ?? "").toLowerCase().includes(term)
+    );
+  }, [categories, search]);
+
   return (
-    <div className="categories-page">
+    <main className="page-content">
+      <PageStack>
+        <PageHeader
+          title="Categories"
+          description="Group your catalogue into clear, reusable segments."
+          actions={
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => void loadCategories()}
+                disabled={loading}
+              >
+                <RefreshIcon size={15} />
+                Refresh
+              </Button>
 
-      <div className="categories-header">
-        <div>
-          <h1>Categories</h1>
-          <p>Manage your product categories</p>
+              <Button variant="primary" onClick={openAddForm}>
+                <PlusIcon size={15} />
+                Add category
+              </Button>
+            </>
+          }
+        />
+
+        {error ? (
+          <div className="alert alert-error" role="alert">
+            <AlertIcon size={16} />
+            <div className="alert-content">
+              <strong>Could not load categories</strong>
+              {error}
+            </div>
+          </div>
+        ) : null}
+
+        <div className="stat-grid">
+          <StatCard
+            label="Total categories"
+            value={formatNumber(categories.length)}
+            tone="lavender"
+            icon={<LayersIcon size={16} />}
+            loading={loading}
+            meta="Configured segments"
+          />
+
+          <StatCard
+            label="Described"
+            value={formatNumber(
+              categories.filter((item) => item.description?.trim()).length
+            )}
+            tone="pink"
+            icon={<TagIcon size={16} />}
+            loading={loading}
+            meta="Categories with a description"
+          />
         </div>
 
-        <button
-          type="button"
-          className="add-category-btn"
-          onClick={openAddForm}
-        >
-          + Add Category
-        </button>
-      </div>
+        <Card>
+          <CardHeader
+            title="All categories"
+            description="Edit or remove the segments attached to your products."
+            actions={
+              <SearchInput
+                value={search}
+                onChange={setSearch}
+                placeholder="Search categories..."
+                label="Search categories"
+              />
+            }
+          />
 
-      {showForm && (
-        <div className="category-form-card">
+          <CardBody>
+            {loading ? (
+              <div className="loading-block">
+                Loading categoriesâ€¦
+              </div>
+            ) : filtered.length === 0 ? (
+              <EmptyState
+                icon={<TagIcon size={20} />}
+                title={
+                  categories.length === 0
+                    ? "No categories yet"
+                    : "No matching categories"
+                }
+                description={
+                  categories.length === 0
+                    ? "Create your first category to start organising products."
+                    : "Try a different keyword."
+                }
+                action={
+                  <Button variant="primary" onClick={openAddForm}>
+                    <PlusIcon size={15} />
+                    Add category
+                  </Button>
+                }
+              />
+            ) : (
+              <div className="tile-grid">
+                {filtered.map((category, index) => (
+                  <article className="tile" key={category.id}>
+                    <div className="tile-head">
+                      <span className={`tile-icon ${CATEGORY_TINTS[index % CATEGORY_TINTS.length]}`}>
+                        <TagIcon size={17} />
+                      </span>
 
-          <div className="category-form-header">
-            <div>
-              <h2>
-                {editingId === null
-                  ? "Add New Category"
-                  : "Edit Category"}
-              </h2>
+                      <div className="tile-body">
+                        <h4>{category.name}</h4>
+                        <p>{category.description || "No description provided."}</p>
+                      </div>
+                    </div>
 
-              <p>
-                Enter category information
-              </p>
-            </div>
+                    <div className="tile-actions">
+                      <span className="toolbar-count">
+                        Category #{category.id}
+                      </span>
 
-            <button
-              type="button"
-              className="close-category-form"
-              onClick={closeForm}
+                      <span className="toolbar-spacer" />
+
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => openEditForm(category)}
+                      >
+                        <PencilIcon size={14} />
+                        Edit
+                      </Button>
+
+                      <Button
+                        size="sm"
+                        variant="soft-danger"
+                        onClick={() => setPendingDelete(category)}
+                      >
+                        <TrashIcon size={14} />
+                      </Button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </CardBody>
+        </Card>
+      </PageStack>
+
+      <Modal
+        open={showForm}
+        title={editingId === null ? "Add new category" : "Edit category"}
+        description="Categories help you filter and report on your catalogue."
+        onClose={closeForm}
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeForm} disabled={saving}>
+              Cancel
+            </Button>
+
+            <Button
+              variant="primary"
+              type="submit"
+              form="category-form"
+              disabled={saving}
             >
-              ✕
-            </button>
-          </div>
-
-          <form onSubmit={saveCategory}>
-
-            <div className="category-form-grid">
-
-              <div className="category-form-group">
-                <label>Category Name</label>
-
-                <input
+              {saving
+                ? "Saving..."
+                : editingId === null
+                  ? "Save category"
+                  : "Update category"}
+            </Button>
+          </>
+        }
+      >
+        <form id="category-form" className="modal-form" onSubmit={saveCategory}>
+          <div className="modal-body">
+            <div className="form-grid">
+              <Field label="Category name" required className="span-2">
+                <Input
                   type="text"
-                  placeholder="Enter category name"
+                  placeholder="e.g. Electronics"
                   value={name}
-                  onChange={(e) =>
-                    setName(e.target.value)
-                  }
+                  onChange={(event) => setName(event.target.value)}
+                  required
                 />
-              </div>
+              </Field>
 
-              <div className="category-form-group">
-                <label>Description</label>
-
-                <input
-                  type="text"
-                  placeholder="Enter description"
+              <Field label="Description" className="span-2">
+                <Textarea
+                  placeholder="Short description of this segment"
                   value={description}
-                  onChange={(e) =>
-                    setDescription(e.target.value)
-                  }
+                  onChange={(event) => setDescription(event.target.value)}
+                  rows={3}
                 />
-              </div>
-
-            </div>
-
-            <div className="category-form-actions">
-
-              <button
-                type="button"
-                className="category-cancel-btn"
-                onClick={closeForm}
-              >
-                Cancel
-              </button>
-
-              <button
-                type="submit"
-                className="save-category-btn"
-              >
-                {editingId === null
-                  ? "Save Category"
-                  : "Update Category"}
-              </button>
-
-            </div>
-
-          </form>
-
-        </div>
-      )}
-
-      <div className="categories-grid">
-
-        {loading ? (
-
-          <div className="category-card">
-            <div className="category-info">
-              <h3>Loading categories...</h3>
+              </Field>
             </div>
           </div>
+        </form>
+      </Modal>
 
-        ) : categories.length === 0 ? (
-
-          <div className="category-card">
-            <div className="category-info">
-              <h3>No categories found</h3>
-              <p>Add your first category.</p>
-            </div>
-          </div>
-
-        ) : (
-
-          categories.map((category) => (
-            <div
-              className="category-card"
-              key={category.id}
-            >
-
-              <div className="category-icon">
-                🏷️
-              </div>
-
-              <div className="category-info">
-                <h3>{category.name}</h3>
-
-                <p>
-                  {category.description ||
-                    "No description"}
-                </p>
-
-                <span>
-                  Category #{category.id}
-                </span>
-              </div>
-
-              <div className="category-actions">
-
-                <button
-                  type="button"
-                  className="category-edit-btn"
-                  onClick={() =>
-                    openEditForm(category)
-                  }
-                >
-                  ✏️ Edit
-                </button>
-
-                <button
-                  type="button"
-                  className="category-delete-btn"
-                  onClick={() =>
-                    deleteCategory(category.id)
-                  }
-                >
-                  🗑️ Delete
-                </button>
-
-              </div>
-
-            </div>
-          ))
-
-        )}
-
-      </div>
-
-    </div>
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={saving}
+        title="Delete category"
+        description={`"${pendingDelete?.name ?? ""}" will be permanently removed. Categories linked to products cannot be deleted.`}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void deleteCategory(pendingDelete);
+        }}
+      />
+    </main>
   );
 }
-
-export default Categories;

@@ -1,8 +1,50 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { supabase } from "../supabase";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { insertOwned, supabase } from "../supabase";
+import { useToast } from "../components/Toast";
+import {
+  AlertIcon,
+  CalendarIcon,
+  CheckCircleIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshIcon,
+  SearchIcon,
+  ShoppingCartIcon,
+  TrashIcon,
+  TrendingUpIcon,
+  WalletIcon,
+} from "../components/Icon";
+import {
+  Badge,
+  Button,
+  Card,
+  CardHeader,
+  ConfirmDialog,
+  EmptyState,
+  Field,
+  Input,
+  Modal,
+  PageHeader,
+  PageStack,
+  SearchInput,
+  Select,
+  SkeletonRows,
+  StatCard,
+} from "../components/ui";
+import { formatMoney, formatNumber, todayISODate } from "../lib/format";
+import { formatDate, toDateInputValue } from "../lib/date";
+import {
+  computeLineTotals,
+  computeSaleStockEffects,
+  resolveName,
+  toNumber,
+  validateSale,
+} from "../lib/inventory";
 
 type Sale = {
   id: number;
+  customerId: number;
+  productId: number;
   customer: string;
   product: string;
   quantity: number;
@@ -20,921 +62,798 @@ type Customer = {
 type Product = {
   id: number;
   name: string;
+  stock: number;
 };
 
-function Sales() {
+export default function Sales() {
+  const toast = useToast();
+
   const [sales, setSales] = useState<Sale[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<Sale | null>(null);
 
   const [search, setSearch] = useState("");
 
-  // Store selected database IDs
   const [customerId, setCustomerId] = useState("");
   const [productId, setProductId] = useState("");
-
   const [quantity, setQuantity] = useState("");
   const [totalAmount, setTotalAmount] = useState("");
   const [paidAmount, setPaidAmount] = useState("");
   const [date, setDate] = useState("");
 
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
-  // =========================
-  // LOAD ALL DATA
-  // =========================
+  // Guards against overlapping loads and double submissions.
+  const loadingRef = useLatch();
+  const savingRef = useLatch();
 
   const loadAllData = async () => {
+    if (!loadingRef.begin()) return;
+
     setLoading(true);
+    setError("");
 
     try {
-      // Load customers
-      const {
-        data: customersData,
-        error: customersError,
-      } = await supabase
-        .from("customers")
-        .select("id, name")
-        .order("id", { ascending: true });
+      const [customersResult, productsResult, salesResult] = await Promise.all([
+        supabase
+          .from("customers")
+          .select("id, name")
+          .order("id", { ascending: true }),
 
-      if (customersError) {
-        console.error("Load Customers Error:", customersError);
-        alert("Failed to load customers.");
+        supabase
+          .from("products")
+          .select("id, name, stock")
+          .order("id", { ascending: true }),
+
+        supabase
+          .from("sales")
+          .select(`
+            id,
+            customer_id,
+            product_id,
+            quantity,
+            total_amount,
+            paid_amount,
+            due_amount,
+            sale_date
+          `)
+          .order("id", { ascending: true }),
+      ]);
+
+      const failure =
+        customersResult.error ?? productsResult.error ?? salesResult.error;
+
+      if (failure) {
+        setError(failure.message);
+        toast.error("Could not load sales", failure.message);
         return;
       }
 
-      // Load products
-      const {
-        data: productsData,
-        error: productsError,
-      } = await supabase
-        .from("products")
-        .select("id, name")
-        .order("id", { ascending: true });
+      const customerList = (customersResult.data ?? []) as Customer[];
 
-      if (productsError) {
-        console.error("Load Products Error:", productsError);
-        alert("Failed to load products.");
-        return;
-      }
+      const productList = (productsResult.data ?? []).map((product) => ({
+        id: toNumber(product.id),
+        name: String(product.name ?? ""),
+        stock: toNumber(product.stock),
+      })) satisfies Product[];
 
-      // Load sales
-      const {
-        data: salesData,
-        error: salesError,
-      } = await supabase
-        .from("sales")
-        .select(`
-          id,
-          customer_id,
-          product_id,
-          quantity,
-          total_amount,
-          paid_amount,
-          due_amount,
-          sale_date
-        `)
-        .order("id", { ascending: true });
+      const customerNames = new Map(customerList.map((c) => [c.id, c.name]));
+      const productNames = new Map(productList.map((p) => [p.id, p.name]));
 
-      if (salesError) {
-        console.error("Load Sales Error:", salesError);
-
-        alert(
-          `Failed to load sales: ${salesError.message}`
+      const formattedSales: Sale[] = (salesResult.data ?? []).map((sale) => {
+        const { total, paid, due } = computeLineTotals(
+          sale.total_amount,
+          sale.paid_amount
         );
 
-        return;
-      }
-
-      const customerList =
-        (customersData || []) as Customer[];
-
-      const productList =
-        (productsData || []) as Product[];
-
-      const formattedSales: Sale[] =
-        (salesData || []).map((sale) => {
-          const foundCustomer =
-            customerList.find(
-              (item) =>
-                Number(item.id) ===
-                Number(sale.customer_id)
-            );
-
-          const foundProduct =
-            productList.find(
-              (item) =>
-                Number(item.id) ===
-                Number(sale.product_id)
-            );
-
-          return {
-            id: Number(sale.id),
-
-            customer:
-              foundCustomer?.name ||
-              `Customer #${sale.customer_id}`,
-
-            product:
-              foundProduct?.name ||
-              `Product #${sale.product_id}`,
-
-            quantity:
-              Number(sale.quantity) || 0,
-
-            totalAmount:
-              Number(sale.total_amount) || 0,
-
-            paidAmount:
-              Number(sale.paid_amount) || 0,
-
-            dueAmount:
-              Number(sale.due_amount) || 0,
-
-            date:
-              sale.sale_date || "",
-          };
-        });
+        return {
+          id: toNumber(sale.id),
+          customerId: toNumber(sale.customer_id),
+          productId: toNumber(sale.product_id),
+          customer: resolveName(customerNames, sale.customer_id, "Customer"),
+          product: resolveName(productNames, sale.product_id, "Product"),
+          quantity: toNumber(sale.quantity),
+          totalAmount: total,
+          paidAmount: paid,
+          dueAmount: due,
+          date: String(sale.sale_date ?? ""),
+        };
+      });
 
       setCustomers(customerList);
       setProducts(productList);
       setSales(formattedSales);
+    } catch (caught) {
+      const message =
+        caught instanceof Error
+          ? caught.message
+          : "Something went wrong while loading data.";
 
-      console.log(
-        "Customers loaded:",
-        customerList
-      );
-
-      console.log(
-        "Products loaded:",
-        productList
-      );
-
-      console.log(
-        "Sales loaded from Supabase:",
-        formattedSales
-      );
-    } catch (error) {
-      console.error(
-        "Unexpected Load Error:",
-        error
-      );
-
-      alert(
-        "Something went wrong while loading data."
-      );
+      setError(message);
+      toast.error("Could not load sales", message);
     } finally {
+      loadingRef.end();
       setLoading(false);
     }
   };
 
-  // =========================
-  // INITIAL LOAD
-  // =========================
-
   useEffect(() => {
-    loadAllData();
+    void loadAllData();
   }, []);
 
-  // =========================
-  // OPEN ADD FORM
-  // =========================
+  /** Current stock for the product selected in the form. */
+  const selectedStock = useMemo(() => {
+    const match = products.find((product) => product.id === Number(productId));
+
+    return match ? match.stock : undefined;
+  }, [products, productId]);
+
+  /**
+   * Units already committed to stock by the sale being edited. They are put
+   * back before the new quantity is validated so an edit never falsely fails
+   * for "not enough stock".
+   */
+  const editingSale = useMemo(
+    () => sales.find((sale) => sale.id === editingId) ?? null,
+    [sales, editingId]
+  );
+
+  const availableForForm = useMemo(() => {
+    if (selectedStock === undefined) return undefined;
+
+    const sameProduct =
+      editingSale?.productId === Number(productId) ? editingSale.quantity : 0;
+
+    return selectedStock + sameProduct;
+  }, [selectedStock, editingSale, productId]);
 
   const openAddForm = () => {
     setEditingId(null);
-
     setCustomerId("");
     setProductId("");
     setQuantity("");
     setTotalAmount("");
     setPaidAmount("");
-
-    setDate(
-      new Date()
-        .toISOString()
-        .split("T")[0]
-    );
-
+    setDate(todayISODate());
     setShowForm(true);
   };
-
-  // =========================
-  // OPEN EDIT FORM
-  // =========================
 
   const openEditForm = (sale: Sale) => {
     setEditingId(sale.id);
 
-    // Find customer ID from customer name
-    const selectedCustomer =
-      customers.find(
-        (item) =>
-          item.name === sale.customer
-      );
+    // FIX: ids are used directly. The previous version matched on display
+    // name, which silently reset the field when a name was duplicated or the
+    // referenced row had since been renamed/deleted.
+    setCustomerId(String(sale.customerId));
+    setProductId(String(sale.productId));
+    setQuantity(String(sale.quantity));
+    setTotalAmount(String(sale.totalAmount));
+    setPaidAmount(String(sale.paidAmount));
 
-    // Find product ID from product name
-    const selectedProduct =
-      products.find(
-        (item) =>
-          item.name === sale.product
-      );
-
-    setCustomerId(
-      selectedCustomer
-        ? String(selectedCustomer.id)
-        : ""
-    );
-
-    setProductId(
-      selectedProduct
-        ? String(selectedProduct.id)
-        : ""
-    );
-
-    setQuantity(
-      sale.quantity.toString()
-    );
-
-    setTotalAmount(
-      sale.totalAmount.toString()
-    );
-
-    setPaidAmount(
-      sale.paidAmount.toString()
-    );
-
-    setDate(sale.date);
+    // FIX: normalise the stored value for <input type="date">. A raw
+    // timestamp such as 2026-01-01T00:00:00+00:00 renders as an empty field.
+    setDate(toDateInputValue(sale.date));
 
     setShowForm(true);
   };
 
-  // =========================
-  // CLOSE FORM
-  // =========================
-
   const closeForm = () => {
     setShowForm(false);
     setEditingId(null);
-
-    setCustomerId("");
-    setProductId("");
-    setQuantity("");
-    setTotalAmount("");
-    setPaidAmount("");
-    setDate("");
+    setSaving(false);
   };
 
-  // =========================
-  // SAVE SALE
-  // =========================
+  /** Apply a signed stock change to a product row. */
+  async function applyStock(productId: number, delta: number) {
+    if (delta === 0) return null;
 
-  const saveSale = async (e: FormEvent) => {
-    e.preventDefault();
+    const { data, error: readError } = await supabase
+      .from("products")
+      .select("id, stock")
+      .eq("id", productId)
+      .maybeSingle();
 
-    if (saving) {
+    if (readError) {
+      console.error("Stock read error:", readError);
+      return readError;
+    }
+
+    const current = toNumber(data?.stock);
+    const next = Math.max(0, current + delta);
+
+    const { data: updatedRows, error: writeError } = await supabase
+      .from("products")
+      .update({ stock: next })
+      .eq("id", productId)
+      .select("id");
+
+    // A 0-row update means the product was filtered out (e.g. by RLS) and the
+    // stock change was never applied. Surface it instead of logging success.
+    if (writeError || !updatedRows || updatedRows.length === 0) {
+      if (writeError) console.error("Stock write error:", writeError);
+      else console.warn("Stock update matched no rows for product:", productId);
+
+      return writeError ?? { message: "Stock update affected 0 rows." };
+    }
+
+    return null;
+  }
+
+  const saveSale = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (saving || !savingRef.begin()) return;
+
+    const issues = validateSale({
+      customerId,
+      productId,
+      quantity,
+      totalAmount,
+      paidAmount,
+      date,
+      availableStock: availableForForm,
+    });
+
+    if (issues.length > 0) {
+      savingRef.end();
+      setSaving(false);
+      toast.error(issues[0].message);
       return;
     }
 
-    // Validation
-    if (!customerId) {
-      alert("Please select a customer.");
-      return;
-    }
+    const { total, paid, due } = computeLineTotals(totalAmount, paidAmount);
+    const nextQuantity = Number(quantity);
+    const nextProductId = Number(productId);
 
-    if (!productId) {
-      alert("Please select a product.");
-      return;
-    }
-
-    if (
-      !quantity ||
-      Number(quantity) <= 0
-    ) {
-      alert("Please enter a valid quantity.");
-      return;
-    }
-
-    if (
-      !totalAmount ||
-      Number(totalAmount) <= 0
-    ) {
-      alert("Please enter total amount.");
-      return;
-    }
-
-    if (!date) {
-      alert("Please select sale date.");
-      return;
-    }
-
-    const total = Number(totalAmount);
-    const paid = Number(paidAmount) || 0;
-
-    if (paid < 0) {
-      alert(
-        "Paid amount cannot be negative."
-      );
-      return;
-    }
-
-    if (paid > total) {
-      alert(
-        "Paid amount cannot be greater than total amount."
-      );
-      return;
-    }
-
-    const due = total - paid;
+    const previous = editingId !== null
+      ? (sales.find((sale) => sale.id === editingId) ?? null)
+      : null;
 
     setSaving(true);
 
     try {
-      // =========================
-      // SALE DATA
-      // =========================
-
       const saleData = {
         customer_id: Number(customerId),
-        product_id: Number(productId),
-        quantity: Number(quantity),
+        product_id: nextProductId,
+        quantity: nextQuantity,
         total_amount: total,
         paid_amount: paid,
         due_amount: due,
         sale_date: date,
       };
 
-      console.log(
-        "Saving Sale:",
-        saleData
-      );
-
-      // =========================
-      // UPDATE
-      // =========================
-
       if (editingId !== null) {
-        const { error } =
-          await supabase
-            .from("sales")
-            .update(saleData)
-            .eq("id", editingId);
-
-        if (error) {
-          console.error(
-            "Update Sale Error:",
-            error
-          );
-
-          alert(
-            `Failed to update sale: ${error.message}`
-          );
-
-          return;
-        }
-
-        alert(
-          "Sale updated successfully!"
-        );
-      }
-
-      // =========================
-      // INSERT
-      // =========================
-
-      else {
-        const {
-          data,
-          error,
-        } = await supabase
+        const { data: updatedRows, error: updateError } = await supabase
           .from("sales")
-          .insert([saleData])
-          .select()
-          .single();
+          .update(saleData)
+          .eq("id", editingId)
+          .select("id");
 
-        if (error) {
-          console.error(
-            "Add Sale Error:",
-            error
-          );
-
-          alert(
-            `Failed to add sale: ${error.message}`
-          );
-
+        if (updateError) {
+          console.error("Update Sale Error:", updateError);
+          toast.error("Could not update sale", updateError.message);
           return;
         }
 
-        console.log(
-          "Sale inserted successfully:",
-          data
+        // A 0-row update means RLS filtered the record away; it is not a success.
+        if (!updatedRows || updatedRows.length === 0) {
+          console.warn("Sale update matched no rows for id:", editingId);
+          toast.error(
+            "Sale was not saved",
+            "No matching record was updated. It may have been deleted, or your account may not have permission to edit it."
+          );
+          return;
+        }
+
+        /**
+         * FIX: moving a sale to a different product previously restored the
+         * old product but computed a zero delta for the new one, so the new
+         * product was never debited and total inventory silently inflated.
+         * `computeSaleStockEffects` returns the full set of movements.
+         */
+        const movements = computeSaleStockEffects({
+          previous,
+          nextProductId,
+          nextQuantity,
+        });
+
+        let stockError: { message: string } | null = null;
+
+        for (const movement of movements) {
+          // eslint-disable-next-line no-await-in-loop -- movements must apply in order
+          const result = await applyStock(movement.productId, movement.delta);
+
+          if (result && !stockError) stockError = result;
+        }
+
+        if (stockError) {
+          toast.error(
+            "Sale saved, but stock was not updated",
+            "Please check this product's quantity."
+          );
+        } else {
+          toast.success("Sale updated successfully");
+        }
+      } else {
+        const { data: inserted, error: insertError } = await insertOwned("sales", [
+          saleData,
+        ]);
+
+        if (insertError) {
+          console.error("Add Sale Error:", insertError);
+          toast.error("Could not add sale", insertError.message);
+          return;
+        }
+
+        const saleId = toNumber(inserted?.id);
+
+        const stockError = await applyStock(
+          nextProductId,
+          computeSaleStockEffects({
+            previous: null,
+            nextProductId,
+            nextQuantity,
+          })[0].delta
         );
 
-        alert(
-          "Sale added successfully!"
-        );
+        if (stockError) {
+          toast.error(
+            "Sale saved, but stock was not updated",
+            "Please check this product's quantity."
+          );
+        } else {
+          toast.success("Sale added successfully", `#${saleId}`);
+        }
       }
 
-      // Reload database data
       await loadAllData();
-
       closeForm();
-    } catch (error) {
-      console.error(
-        "Unexpected Save Error:",
-        error
-      );
-
-      alert(
-        "Something went wrong while saving the sale."
+    } catch (caught) {
+      console.error("Unexpected Save Error:", caught);
+      toast.error(
+        "Something went wrong while saving the sale",
+        caught instanceof Error ? caught.message : undefined
       );
     } finally {
+      savingRef.end();
       setSaving(false);
     }
   };
 
-  // =========================
-  // DELETE SALE
-  // =========================
+  const deleteSale = async (sale: Sale) => {
+    if (!savingRef.begin()) return;
 
-  const deleteSale = async (
-    id: number
-  ) => {
-    const confirmed =
-      window.confirm(
-        "Are you sure you want to delete this sale?"
+    setSaving(true);
+
+    const { error: deleteError } = await supabase
+      .from("sales")
+      .delete()
+      .eq("id", sale.id)
+      .select("id");
+
+    if (deleteError) {
+      console.error("Delete Sale Error:", deleteError);
+      toast.error("Could not delete sale", deleteError.message);
+    } else {
+      // Deleted sales must return their units to stock.
+      const stockError = await applyStock(
+        sale.productId,
+        computeSaleStockEffects({
+          previous: {
+            productId: sale.productId,
+            quantity: sale.quantity,
+          },
+          nextProductId: sale.productId,
+          nextQuantity: sale.quantity,
+          deleting: true,
+        })[0].delta
       );
 
-    if (!confirmed) {
-      return;
+      if (stockError) {
+        toast.error(
+          "Sale deleted, but stock was not restored",
+          "Please check this product's quantity."
+        );
+      } else {
+        toast.success("Sale deleted successfully");
+      }
+
+      await loadAllData();
     }
 
-    const { error } =
-      await supabase
-        .from("sales")
-        .delete()
-        .eq("id", id);
-
-    if (error) {
-      console.error(
-        "Delete Sale Error:",
-        error
-      );
-
-      alert(
-        `Failed to delete sale: ${error.message}`
-      );
-
-      return;
-    }
-
-    await loadAllData();
-
-    alert(
-      "Sale deleted successfully!"
-    );
+    savingRef.end();
+    setSaving(false);
+    setPendingDelete(null);
   };
 
-  // =========================
-  // SEARCH
-  // =========================
+  const filteredSales = useMemo(() => {
+    const term = search.toLowerCase().trim();
 
-  const filteredSales =
-    sales.filter((sale) => {
-      const searchText =
-        search.toLowerCase().trim();
+    if (!term) return sales;
 
-      return (
-        sale.customer
-          .toLowerCase()
-          .includes(searchText) ||
-        sale.product
-          .toLowerCase()
-          .includes(searchText) ||
-        sale.date
-          .toLowerCase()
-          .includes(searchText)
-      );
+    return sales.filter(
+      (sale) =>
+        sale.customer.toLowerCase().includes(term) ||
+        sale.product.toLowerCase().includes(term) ||
+        sale.date.toLowerCase().includes(term)
+    );
+  }, [sales, search]);
+
+  const summary = useMemo(() => {
+    let billed = 0;
+    let collected = 0;
+    let due = 0;
+    let units = 0;
+
+    sales.forEach((sale) => {
+      billed += sale.totalAmount;
+      collected += sale.paidAmount;
+      due += sale.dueAmount;
+      units += sale.quantity;
     });
 
-  // =========================
-  // UI
-  // =========================
+    return { billed, collected, due, units };
+  }, [sales]);
+
+  const preview = computeLineTotals(totalAmount, paidAmount);
 
   return (
-    <div className="sales-page">
-
-      {/* HEADER */}
-
-      <div className="sales-header">
-
-        <div>
-          <h1>Sales</h1>
-
-          <p>
-            Manage sales transactions and payments
-          </p>
-        </div>
-
-        <button
-          type="button"
-          className="add-sale-btn"
-          onClick={openAddForm}
-        >
-          + New Sale
-        </button>
-
-      </div>
-
-      {/* FORM */}
-
-      {showForm && (
-        <div className="sale-form-card">
-
-          <div className="sale-form-header">
-
-            <div>
-              <h2>
-                {editingId === null
-                  ? "Create New Sale"
-                  : "Edit Sale"}
-              </h2>
-
-              <p>
-                Enter sale transaction details
-              </p>
-            </div>
-
-            <button
-              type="button"
-              className="close-sale-form"
-              onClick={closeForm}
-            >
-              ✕
-            </button>
-
-          </div>
-
-          <form onSubmit={saveSale}>
-
-            <div className="sale-form-grid">
-
-              {/* CUSTOMER */}
-
-              <div className="sale-form-group">
-
-                <label>
-                  Customer
-                </label>
-
-                <select
-                  value={customerId}
-                  onChange={(e) =>
-                    setCustomerId(
-                      e.target.value
-                    )
-                  }
-                >
-                  <option value="">
-                    Select Customer
-                  </option>
-
-                  {customers.map(
-                    (item) => (
-                      <option
-                        key={item.id}
-                        value={item.id}
-                      >
-                        {item.name}
-                      </option>
-                    )
-                  )}
-                </select>
-
-              </div>
-
-              {/* PRODUCT */}
-
-              <div className="sale-form-group">
-
-                <label>
-                  Product
-                </label>
-
-                <select
-                  value={productId}
-                  onChange={(e) =>
-                    setProductId(
-                      e.target.value
-                    )
-                  }
-                >
-                  <option value="">
-                    Select Product
-                  </option>
-
-                  {products.map(
-                    (item) => (
-                      <option
-                        key={item.id}
-                        value={item.id}
-                      >
-                        {item.name}
-                      </option>
-                    )
-                  )}
-                </select>
-
-              </div>
-
-              {/* QUANTITY */}
-
-              <div className="sale-form-group">
-
-                <label>
-                  Quantity
-                </label>
-
-                <input
-                  type="number"
-                  min="1"
-                  placeholder="Enter quantity"
-                  value={quantity}
-                  onChange={(e) =>
-                    setQuantity(
-                      e.target.value
-                    )
-                  }
-                />
-
-              </div>
-
-              {/* DATE */}
-
-              <div className="sale-form-group">
-
-                <label>
-                  Sale Date
-                </label>
-
-                <input
-                  type="date"
-                  value={date}
-                  onChange={(e) =>
-                    setDate(
-                      e.target.value
-                    )
-                  }
-                />
-
-              </div>
-
-              {/* TOTAL */}
-
-              <div className="sale-form-group">
-
-                <label>
-                  Total Amount
-                </label>
-
-                <input
-                  type="number"
-                  min="0"
-                  placeholder="0"
-                  value={totalAmount}
-                  onChange={(e) =>
-                    setTotalAmount(
-                      e.target.value
-                    )
-                  }
-                />
-
-              </div>
-
-              {/* PAID */}
-
-              <div className="sale-form-group">
-
-                <label>
-                  Paid Amount
-                </label>
-
-                <input
-                  type="number"
-                  min="0"
-                  placeholder="0"
-                  value={paidAmount}
-                  onChange={(e) =>
-                    setPaidAmount(
-                      e.target.value
-                    )
-                  }
-                />
-
-              </div>
-
-            </div>
-
-            {/* FORM BUTTONS */}
-
-            <div className="sale-form-actions">
-
-              <button
-                type="button"
-                className="sale-cancel-btn"
-                onClick={closeForm}
+    <main className="page-content">
+      <PageStack>
+        <PageHeader
+          title="Sales"
+          description="Record transactions, track collections and manage outstanding balances."
+          actions={
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => void loadAllData()}
+                disabled={loading}
               >
-                Cancel
-              </button>
+                <RefreshIcon size={15} />
+                Refresh
+              </Button>
 
-              <button
-                type="submit"
-                className="save-sale-btn"
-                disabled={saving}
-              >
-                {saving
-                  ? "Saving..."
-                  : editingId === null
-                  ? "Save Sale"
-                  : "Update Sale"}
-              </button>
-
-            </div>
-
-          </form>
-
-        </div>
-      )}
-
-      {/* SEARCH */}
-
-      <div className="sales-toolbar">
-
-        <input
-          type="text"
-          placeholder="Search by customer, product or date..."
-          value={search}
-          onChange={(e) =>
-            setSearch(e.target.value)
+              <Button variant="primary" onClick={openAddForm}>
+                <PlusIcon size={15} />
+                New sale
+              </Button>
+            </>
           }
         />
 
-        <span>
-          {filteredSales.length} sale
-          {filteredSales.length !== 1
-            ? "s"
-            : ""}
-        </span>
+        {error ? (
+          <div className="alert alert-error" role="alert">
+            <AlertIcon size={16} />
+            <div className="alert-content">
+              <strong>Could not load sales</strong>
+              {error}
+            </div>
+          </div>
+        ) : null}
 
-      </div>
+        <div className="stat-grid">
+          <StatCard
+            label="Total billed"
+            value={formatMoney(summary.billed, 0)}
+            tone="lavender"
+            icon={<TrendingUpIcon size={16} />}
+            loading={loading}
+            meta={`${formatNumber(sales.length)} transactions`}
+          />
 
-      {/* TABLE */}
+          <StatCard
+            label="Collected"
+            value={formatMoney(summary.collected, 0)}
+            tone="mint"
+            icon={<CheckCircleIcon size={16} />}
+            loading={loading}
+            meta="Payments received"
+          />
 
-      <div className="sales-table-container">
+          <StatCard
+            label="Outstanding"
+            value={formatMoney(summary.due, 0)}
+            tone="yellow"
+            icon={<WalletIcon size={16} />}
+            loading={loading}
+            meta="Still awaiting payment"
+          />
 
-        <table className="sales-table">
+          <StatCard
+            label="Units sold"
+            value={formatNumber(summary.units)}
+            tone="pink"
+            icon={<ShoppingCartIcon size={16} />}
+            loading={loading}
+            meta="Across all sales"
+          />
+        </div>
 
-          <thead>
+        <Card>
+          <CardHeader
+            title="Sales ledger"
+            description={`${filteredSales.length} of ${sales.length} transactions shown`}
+            actions={
+              <SearchInput
+                value={search}
+                onChange={setSearch}
+                placeholder="Search customer, product or date..."
+                label="Search sales"
+              />
+            }
+          />
 
-            <tr>
-              <th>Customer</th>
-              <th>Product</th>
-              <th>Qty</th>
-              <th>Total</th>
-              <th>Paid</th>
-              <th>Due</th>
-              <th>Date</th>
-              <th>Actions</th>
-            </tr>
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Customer</th>
+                  <th>Product</th>
+                  <th className="num">Qty</th>
+                  <th className="num">Total</th>
+                  <th className="num">Paid</th>
+                  <th className="num">Due</th>
+                  <th>Date</th>
+                  <th>Status</th>
+                  <th className="actions-cell">Actions</th>
+                </tr>
+              </thead>
 
-          </thead>
-
-          <tbody>
-
-            {loading ? (
-
-              <tr>
-                <td
-                  colSpan={8}
-                  className="no-sales"
-                >
-                  Loading sales...
-                </td>
-              </tr>
-
-            ) : filteredSales.length > 0 ? (
-
-              filteredSales.map(
-                (sale) => (
-
-                  <tr key={sale.id}>
-
-                    <td>
-                      <strong>
-                        {sale.customer}
-                      </strong>
-                    </td>
-
-                    <td>
-                      {sale.product}
-                    </td>
-
-                    <td>
-                      {sale.quantity}
-                    </td>
-
-                    <td>
-                      Rs.{" "}
-                      {sale.totalAmount.toLocaleString()}
-                    </td>
-
-                    <td>
-                      Rs.{" "}
-                      {sale.paidAmount.toLocaleString()}
-                    </td>
-
-                    <td>
-
-                      <span
-                        className={
-                          sale.dueAmount > 0
-                            ? "sale-due"
-                            : "sale-paid"
+              <tbody>
+                {loading ? (
+                  <SkeletonRows rows={6} />
+                ) : filteredSales.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="table-empty-cell">
+                      <EmptyState
+                        icon={<SearchIcon size={20} />}
+                        title={
+                          sales.length === 0 ? "No sales yet" : "No sales found"
                         }
-                      >
-                        Rs.{" "}
-                        {sale.dueAmount.toLocaleString()}
-                      </span>
-
+                        description={
+                          sales.length === 0
+                            ? "Record your first transaction to start building revenue reports."
+                            : "Try a different search term."
+                        }
+                        action={
+                          <Button variant="primary" onClick={openAddForm}>
+                            <PlusIcon size={15} />
+                            New sale
+                          </Button>
+                        }
+                      />
                     </td>
-
-                    <td>
-                      {sale.date}
-                    </td>
-
-                    <td>
-
-                      <div className="sale-actions">
-
-                        <button
-                          type="button"
-                          className="sale-edit-btn"
-                          onClick={() =>
-                            openEditForm(
-                              sale
-                            )
-                          }
-                        >
-                          ✏️ Edit
-                        </button>
-
-                        <button
-                          type="button"
-                          className="sale-delete-btn"
-                          onClick={() =>
-                            deleteSale(
-                              sale.id
-                            )
-                          }
-                        >
-                          🗑️ Delete
-                        </button>
-
-                      </div>
-
-                    </td>
-
                   </tr>
+                ) : (
+                  filteredSales.map((sale) => (
+                    <tr key={sale.id}>
+                      <td className="cell-primary">{sale.customer}</td>
 
-                )
-              )
+                      <td>{sale.product}</td>
 
-            ) : (
+                      <td className="num">{sale.quantity}</td>
 
-              <tr>
+                      <td className="num cell-strong">
+                        {formatMoney(sale.totalAmount)}
+                      </td>
 
-                <td
-                  colSpan={8}
-                  className="no-sales"
+                      <td className="num money-pos">
+                        {formatMoney(sale.paidAmount)}
+                      </td>
+
+                      <td className="num">
+                        {sale.dueAmount > 0 ? (
+                          <span className="money-neg">
+                            {formatMoney(sale.dueAmount)}
+                          </span>
+                        ) : (
+                          <span className="cell-muted">—</span>
+                        )}
+                      </td>
+
+                      <td className="cell-muted">{formatDate(sale.date)}</td>
+
+                      <td>
+                        <Badge tone={sale.dueAmount > 0 ? "yellow" : "mint"}>
+                          {sale.dueAmount > 0 ? "Partial" : "Paid"}
+                        </Badge>
+                      </td>
+
+                      <td className="actions-cell">
+                        <span className="row-actions">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => openEditForm(sale)}
+                          >
+                            <PencilIcon size={14} />
+                            Edit
+                          </Button>
+
+                          <Button
+                            size="sm"
+                            variant="soft-danger"
+                            onClick={() => setPendingDelete(sale)}
+                          >
+                            <TrashIcon size={14} />
+                          </Button>
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </PageStack>
+
+      <Modal
+        open={showForm}
+        title={editingId === null ? "Create new sale" : "Edit sale"}
+        description="Enter the transaction details and payment received."
+        onClose={closeForm}
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeForm} disabled={saving}>
+              Cancel
+            </Button>
+
+            <Button
+              variant="primary"
+              type="submit"
+              form="sale-form"
+              disabled={saving}
+            >
+              {saving
+                ? "Saving..."
+                : editingId === null
+                  ? "Save sale"
+                  : "Update sale"}
+            </Button>
+          </>
+        }
+      >
+        <form id="sale-form" className="modal-form" onSubmit={saveSale}>
+          <div className="modal-body">
+            <div className="form-grid">
+              <Field label="Customer" required>
+                <Select
+                  value={customerId}
+                  onChange={(event) => setCustomerId(event.target.value)}
                 >
-                  No sales found.
-                </td>
+                  <option value="">Select customer</option>
 
-              </tr>
+                  {customers.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
 
-            )}
+              <Field
+                label="Product"
+                required
+                hint={
+                  selectedStock === undefined
+                    ? undefined
+                    : `${availableForForm} unit${
+                        availableForForm === 1 ? "" : "s"
+                      } available`
+                }
+              >
+                <Select
+                  value={productId}
+                  onChange={(event) => setProductId(event.target.value)}
+                >
+                  <option value="">Select product</option>
 
-          </tbody>
+                  {products.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
 
-        </table>
+              <Field label="Quantity" required>
+                <Input
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="1"
+                  value={quantity}
+                  onChange={(event) => setQuantity(event.target.value)}
+                />
+              </Field>
 
-      </div>
+              <Field label="Sale date" required>
+                <span style={{ position: "relative", display: "block" }}>
+                  <span
+                    style={{
+                      position: "absolute",
+                      left: 11,
+                      top: "50%",
+                      transform: "translateY(-50%)",
+                      color: "var(--text-muted)",
+                      pointerEvents: "none",
+                    }}
+                  >
+                    <CalendarIcon size={15} />
+                  </span>
 
-    </div>
+                  <Input
+                    type="date"
+                    value={date}
+                    onChange={(event) => setDate(event.target.value)}
+                    style={{ paddingLeft: 34 }}
+                  />
+                </span>
+              </Field>
+
+              <Field label="Total amount (Rs.)" required>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={totalAmount}
+                  onChange={(event) => setTotalAmount(event.target.value)}
+                />
+              </Field>
+
+              <Field
+                label="Paid amount (Rs.)"
+                hint={`Balance after payment: ${formatMoney(preview.due)}`}
+              >
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={paidAmount}
+                  onChange={(event) => setPaidAmount(event.target.value)}
+                />
+              </Field>
+            </div>
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={saving}
+        title="Delete sale"
+        description={`The transaction for "${pendingDelete?.customer ?? ""}" worth ${formatMoney(pendingDelete?.totalAmount ?? 0)} will be removed and its units returned to stock.`}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void deleteSale(pendingDelete);
+        }}
+      />
+    </main>
   );
 }
 
-export default Sales;
+/** Simple re-entrancy latch so overlapping async work cannot double-apply. */
+function useLatch() {
+  const active = useRef(false);
+
+  return {
+    begin: () => {
+      if (active.current) return false;
+      active.current = true;
+      return true;
+    },
+    end: () => {
+      active.current = false;
+    },
+  };
+}

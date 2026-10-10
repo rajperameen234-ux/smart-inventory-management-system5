@@ -1,5 +1,37 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { supabase } from "../supabase";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { insertOwned, supabase } from "../supabase";
+import { useToast } from "../components/Toast";
+import {
+  AlertIcon,
+  MailIcon,
+  MapPinIcon,
+  PencilIcon,
+  PhoneIcon,
+  PlusIcon,
+  RefreshIcon,
+  SearchIcon,
+  TrashIcon,
+  TruckIcon,
+} from "../components/Icon";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  ConfirmDialog,
+  EmptyState,
+  Field,
+  Input,
+  Modal,
+  PageHeader,
+  PageStack,
+  SearchInput,
+  SkeletonRows,
+  StatCard,
+  Textarea,
+} from "../components/ui";
+import { formatNumber, initials, toNumber } from "../lib/format";
 
 type Supplier = {
   id: number;
@@ -10,14 +42,21 @@ type Supplier = {
   address: string;
 };
 
-function Suppliers() {
+export default function Suppliers({
+  searchSeed = "",
+}: {
+  searchSeed?: string;
+}) {
+  const toast = useToast();
+
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  const [search, setSearch] = useState(searchSeed);
 
   const [showForm, setShowForm] = useState(false);
-  const [editingId, setEditingId] =
-    useState<number | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
 
-  const [search, setSearch] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<Supplier | null>(null);
 
   const [company, setCompany] = useState("");
   const [contact, setContact] = useState("");
@@ -26,33 +65,37 @@ function Suppliers() {
   const [address, setAddress] = useState("");
 
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
-  // LOAD SUPPLIERS FROM SUPABASE
+  useEffect(() => {
+    if (searchSeed) setSearch(searchSeed);
+  }, [searchSeed]);
+
   const loadSuppliers = async () => {
     setLoading(true);
+    setError("");
 
-    const { data, error } = await supabase
+    const { data, error: loadError } = await supabase
       .from("suppliers")
       .select("*")
       .order("id", { ascending: true });
 
-    if (error) {
-      console.error("Load Suppliers Error:", error);
-      alert("Failed to load suppliers from database.");
+    if (loadError) {
+      console.error("Load Suppliers Error:", loadError);
+      setError(loadError.message);
       setLoading(false);
+      toast.error("Could not load suppliers", loadError.message);
       return;
     }
 
-    setSuppliers(data || []);
+    setSuppliers((data || []) as Supplier[]);
     setLoading(false);
   };
 
-  // LOAD WHEN PAGE OPENS
   useEffect(() => {
-    loadSuppliers();
+    void loadSuppliers();
   }, []);
 
-  // ADD SUPPLIER FORM
   const openAddForm = () => {
     setEditingId(null);
     setCompany("");
@@ -63,7 +106,6 @@ function Suppliers() {
     setShowForm(true);
   };
 
-  // EDIT SUPPLIER FORM
   const openEditForm = (supplier: Supplier) => {
     setEditingId(supplier.id);
     setCompany(supplier.company);
@@ -74,372 +116,455 @@ function Suppliers() {
     setShowForm(true);
   };
 
-  // CLOSE FORM
   const closeForm = () => {
     setShowForm(false);
     setEditingId(null);
-    setCompany("");
-    setContact("");
-    setPhone("");
-    setEmail("");
-    setAddress("");
+    setSaving(false);
   };
 
-  // SAVE / UPDATE SUPPLIER
-  const saveSupplier = async (e: FormEvent) => {
-    e.preventDefault();
+  const supplierPayload = () => ({
+    company: company.trim(),
+    contact: contact.trim(),
+    phone: phone.trim(),
+    email: email.trim(),
+    address: address.trim(),
+  });
+
+  const saveSupplier = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
 
     if (!company.trim() || !contact.trim() || !phone.trim()) {
-      alert("Please fill Company, Contact Person and Phone.");
+      toast.error(
+        "Missing details",
+        "Please fill Company, Contact Person and Phone."
+      );
       return;
     }
 
-    // UPDATE
-    if (editingId !== null) {
-      const { error } = await supabase
-        .from("suppliers")
-        .update({
-          company: company.trim(),
-          contact: contact.trim(),
-          phone: phone.trim(),
-          email: email.trim(),
-          address: address.trim(),
-        })
-        .eq("id", editingId);
+    if (saving) return;
 
-      if (error) {
-        console.error("Update Supplier Error:", error);
-        alert("Failed to update supplier.");
+    setSaving(true);
+
+    const supplierData = supplierPayload();
+
+    if (editingId !== null) {
+      const { data: updatedRows, error: updateError } = await supabase
+        .from("suppliers")
+        .update(supplierData)
+        .eq("id", editingId)
+        .select("id");
+
+      if (updateError) {
+        console.error("Update Supplier Error:", updateError);
+        toast.error("Could not update supplier", updateError.message);
+        setSaving(false);
+        return;
+      }
+
+      if (!updatedRows || updatedRows.length === 0) {
+        toast.error(
+          "Supplier was not saved",
+          "No matching row was updated. It may have been deleted, or your account may not have permission to edit it."
+        );
+        setSaving(false);
         return;
       }
 
       setSuppliers((current) =>
         current.map((supplier) =>
           supplier.id === editingId
-            ? {
-                ...supplier,
-                company: company.trim(),
-                contact: contact.trim(),
-                phone: phone.trim(),
-                email: email.trim(),
-                address: address.trim(),
-              }
+            ? { ...supplier, ...supplierData }
             : supplier
         )
       );
 
-      alert("Supplier updated successfully!");
+      toast.success("Supplier updated", supplierData.company);
     } else {
-      // ADD
-      const { data, error } = await supabase
-        .from("suppliers")
-        .insert([
-          {
-            company: company.trim(),
-            contact: contact.trim(),
-            phone: phone.trim(),
-            email: email.trim(),
-            address: address.trim(),
-          },
-        ])
-        .select()
-        .single();
+      const { data, error: insertError } = await insertOwned("suppliers", [
+        supplierData,
+      ]);
 
-      if (error) {
-        console.error("Add Supplier Error:", error);
-        alert("Failed to add supplier.");
+      if (insertError) {
+        console.error("Add Supplier Error:", insertError);
+        toast.error("Could not add supplier", insertError.message);
+        setSaving(false);
         return;
       }
 
+      // Never push a null row into local state if the insert returned nothing.
+      const row = (data ?? supplierData) as Supplier;
+
       setSuppliers((current) => [
         ...current,
-        data,
+        { ...row, id: toNumber(row.id) },
       ]);
-
-      alert("Supplier added successfully!");
+      toast.success("Supplier added", supplierData.company);
     }
 
     closeForm();
   };
 
-  // DELETE SUPPLIER
-  const deleteSupplier = async (id: number) => {
-    if (
-      !window.confirm(
-        "Are you sure you want to delete this supplier?"
-      )
-    ) {
-      return;
-    }
+  const deleteSupplier = async (supplier: Supplier) => {
+    setSaving(true);
 
-    const { error } = await supabase
+    const { error: deleteError } = await supabase
       .from("suppliers")
       .delete()
-      .eq("id", id);
+      .eq("id", supplier.id)
+      .select("id");
 
-    if (error) {
-      console.error("Delete Supplier Error:", error);
-      alert("Failed to delete supplier.");
+    setSaving(false);
+    setPendingDelete(null);
+
+    if (deleteError) {
+      console.error("Delete Supplier Error:", deleteError);
+      toast.error("Could not delete supplier", deleteError.message);
       return;
     }
 
     setSuppliers((current) =>
-      current.filter((supplier) => supplier.id !== id)
+      current.filter((item) => item.id !== supplier.id)
     );
 
-    alert("Supplier deleted successfully!");
+    toast.success("Supplier deleted", supplier.company);
   };
 
-  // SEARCH
-  const filteredSuppliers = suppliers.filter((supplier) =>
-    `${supplier.company} ${supplier.contact} ${supplier.phone}`
-      .toLowerCase()
-      .includes(search.toLowerCase())
-  );
+  const filteredSuppliers = useMemo(() => {
+    const term = search.toLowerCase().trim();
+
+    if (!term) return suppliers;
+
+    return suppliers.filter((supplier) =>
+      `${supplier.company} ${supplier.contact} ${supplier.phone} ${supplier.email}`
+        .toLowerCase()
+        .includes(term)
+    );
+  }, [suppliers, search]);
+
+  const withEmail = suppliers.filter((item) => item.email?.trim()).length;
 
   return (
-    <div className="suppliers-page">
-
-      <div className="suppliers-header">
-        <div>
-          <h1>Suppliers</h1>
-          <p>Manage your suppliers and vendors</p>
-        </div>
-
-        <button
-          type="button"
-          className="add-supplier-btn"
-          onClick={openAddForm}
-        >
-          + Add Supplier
-        </button>
-      </div>
-
-      {showForm && (
-        <div className="supplier-form-card">
-
-          <div className="supplier-form-header">
-            <div>
-              <h2>
-                {editingId === null
-                  ? "Add New Supplier"
-                  : "Edit Supplier"}
-              </h2>
-
-              <p>Enter supplier information</p>
-            </div>
-
-            <button
-              type="button"
-              className="close-supplier-form"
-              onClick={closeForm}
-            >
-              ✕
-            </button>
-          </div>
-
-          <form onSubmit={saveSupplier}>
-
-            <div className="supplier-form-grid">
-
-              <div className="supplier-form-group">
-                <label>Company Name</label>
-
-                <input
-                  type="text"
-                  placeholder="Enter company name"
-                  value={company}
-                  onChange={(e) =>
-                    setCompany(e.target.value)
-                  }
-                />
-              </div>
-
-              <div className="supplier-form-group">
-                <label>Contact Person</label>
-
-                <input
-                  type="text"
-                  placeholder="Enter contact person"
-                  value={contact}
-                  onChange={(e) =>
-                    setContact(e.target.value)
-                  }
-                />
-              </div>
-
-              <div className="supplier-form-group">
-                <label>Phone</label>
-
-                <input
-                  type="text"
-                  placeholder="0300-1234567"
-                  value={phone}
-                  onChange={(e) =>
-                    setPhone(e.target.value)
-                  }
-                />
-              </div>
-
-              <div className="supplier-form-group">
-                <label>Email</label>
-
-                <input
-                  type="email"
-                  placeholder="supplier@email.com"
-                  value={email}
-                  onChange={(e) =>
-                    setEmail(e.target.value)
-                  }
-                />
-              </div>
-
-              <div className="supplier-form-group supplier-full-width">
-                <label>Address</label>
-
-                <input
-                  type="text"
-                  placeholder="Enter supplier address"
-                  value={address}
-                  onChange={(e) =>
-                    setAddress(e.target.value)
-                  }
-                />
-              </div>
-
-            </div>
-
-            <div className="supplier-form-actions">
-
-              <button
-                type="button"
-                className="supplier-cancel-btn"
-                onClick={closeForm}
+    <main className="page-content">
+      <PageStack>
+        <PageHeader
+          title="Suppliers"
+          description="Keep every vendor, contact and delivery address in one place."
+          actions={
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => void loadSuppliers()}
+                disabled={loading}
               >
-                Cancel
-              </button>
+                <RefreshIcon size={15} />
+                Refresh
+              </Button>
 
-              <button
-                type="submit"
-                className="save-supplier-btn"
-              >
-                {editingId === null
-                  ? "Save Supplier"
-                  : "Update Supplier"}
-              </button>
-
-            </div>
-
-          </form>
-        </div>
-      )}
-
-      <div className="suppliers-toolbar">
-
-        <input
-          type="text"
-          placeholder="🔍 Search suppliers..."
-          value={search}
-          onChange={(e) =>
-            setSearch(e.target.value)
+              <Button variant="primary" onClick={openAddForm}>
+                <PlusIcon size={15} />
+                Add supplier
+              </Button>
+            </>
           }
         />
 
-        <span>
-          {filteredSuppliers.length} Suppliers
-        </span>
+        {error ? (
+          <div className="alert alert-error" role="alert">
+            <AlertIcon size={16} />
+            <div className="alert-content">
+              <strong>Could not load suppliers</strong>
+              {error}
+            </div>
+          </div>
+        ) : null}
 
-      </div>
+        <div className="stat-grid">
+          <StatCard
+            label="Total suppliers"
+            value={formatNumber(suppliers.length)}
+            tone="sky"
+            icon={<TruckIcon size={16} />}
+            loading={loading}
+            meta="Active vendor partners"
+          />
 
-      <div className="suppliers-table-container">
+          <StatCard
+            label="With email on file"
+            value={formatNumber(withEmail)}
+            tone="lavender"
+            icon={<MailIcon size={16} />}
+            loading={loading}
+            meta="Reachable by email"
+          />
+        </div>
 
-        <table className="suppliers-table">
+        <Card>
+          <CardHeader
+            title="Supplier directory"
+            description={`${filteredSuppliers.length} of ${suppliers.length} shown`}
+            actions={
+              <SearchInput
+                value={search}
+                onChange={setSearch}
+                placeholder="Search suppliers..."
+                label="Search suppliers"
+              />
+            }
+          />
 
-          <thead>
-            <tr>
-              <th>Company</th>
-              <th>Contact Person</th>
-              <th>Phone</th>
-              <th>Email</th>
-              <th>Address</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-
-          <tbody>
-
-            {loading ? (
-
-              <tr>
-                <td colSpan={6} className="no-suppliers">
-                  Loading suppliers...
-                </td>
-              </tr>
-
-            ) : filteredSuppliers.length === 0 ? (
-
-              <tr>
-                <td colSpan={6} className="no-suppliers">
-                  No suppliers found.
-                </td>
-              </tr>
-
-            ) : (
-
-              filteredSuppliers.map((supplier) => (
-                <tr key={supplier.id}>
-
-                  <td>
-                    <strong>{supplier.company}</strong>
-                  </td>
-
-                  <td>{supplier.contact}</td>
-
-                  <td>{supplier.phone}</td>
-
-                  <td>{supplier.email || "-"}</td>
-
-                  <td>{supplier.address || "-"}</td>
-
-                  <td>
-                    <div className="supplier-actions">
-
-                      <button
-                        type="button"
-                        className="supplier-edit-btn"
-                        onClick={() =>
-                          openEditForm(supplier)
-                        }
-                      >
-                        ✏️ Edit
-                      </button>
-
-                      <button
-                        type="button"
-                        className="supplier-delete-btn"
-                        onClick={() =>
-                          deleteSupplier(supplier.id)
-                        }
-                      >
-                        🗑️ Delete
-                      </button>
-
-                    </div>
-                  </td>
-
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Company</th>
+                  <th>Contact person</th>
+                  <th>Phone</th>
+                  <th>Email</th>
+                  <th>Address</th>
+                  <th className="actions-cell">Actions</th>
                 </tr>
-              ))
+              </thead>
 
-            )}
+              <tbody>
+                {loading ? (
+                  <SkeletonRows rows={6} />
+                ) : filteredSuppliers.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="table-empty-cell">
+                      <EmptyState
+                        icon={<SearchIcon size={20} />}
+                        title={
+                          suppliers.length === 0
+                            ? "No suppliers yet"
+                            : "No suppliers found"
+                        }
+                        description={
+                          suppliers.length === 0
+                            ? "Add your first vendor to start tracking purchase partners."
+                            : "Try adjusting your search term."
+                        }
+                        action={
+                          <Button variant="primary" onClick={openAddForm}>
+                            <PlusIcon size={15} />
+                            Add supplier
+                          </Button>
+                        }
+                      />
+                    </td>
+                  </tr>
+                ) : (
+                  filteredSuppliers.map((supplier) => (
+                    <tr key={supplier.id}>
+                      <td>
+                        <span className="cell-stack">
+                          <strong className="cell-primary">
+                            {supplier.company}
+                          </strong>
+                          <small>Supplier #{supplier.id}</small>
+                        </span>
+                      </td>
 
-          </tbody>
+                      <td className="cell-primary">{supplier.contact}</td>
 
-        </table>
+                      <td>
+                        <span className="cell-stack">
+                          <span>{supplier.phone || "â€”"}</span>
+                        </span>
+                      </td>
 
-      </div>
+                      <td>
+                        {supplier.email ? (
+                          <a
+                            href={`mailto:${supplier.email}`}
+                            style={{ fontSize: 13 }}
+                          >
+                            {supplier.email}
+                          </a>
+                        ) : (
+                          <span className="cell-muted">â€”</span>
+                        )}
+                      </td>
 
-    </div>
+                      <td>
+                        <span
+                          className="truncate"
+                          style={{ display: "inline-block" }}
+                        >
+                          {supplier.address || "â€”"}
+                        </span>
+                      </td>
+
+                      <td className="actions-cell">
+                        <span className="row-actions">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => openEditForm(supplier)}
+                          >
+                            <PencilIcon size={14} />
+                            Edit
+                          </Button>
+
+                          <Button
+                            size="sm"
+                            variant="soft-danger"
+                            onClick={() => setPendingDelete(supplier)}
+                          >
+                            <TrashIcon size={14} />
+                          </Button>
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+
+        {filteredSuppliers.length > 0 ? (
+          <div className="equal-grid">
+            {filteredSuppliers.slice(0, 6).map((supplier) => (
+              <Card key={`card-${supplier.id}`}>
+                <CardBody>
+                  <div className="tile-head">
+                    <span className="avatar avatar-lg">
+                      {initials(supplier.company)}
+                    </span>
+
+                    <div className="tile-body">
+                      <h4>{supplier.company}</h4>
+                      <p>{supplier.contact || "No contact on file"}</p>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      flexWrap: "wrap",
+                      gap: 8,
+                      marginTop: 14,
+                    }}
+                  >
+                    {supplier.phone ? (
+                      <Badge tone="neutral" plain>
+                        <PhoneIcon size={12} />
+                        {supplier.phone}
+                      </Badge>
+                    ) : null}
+
+                    {supplier.email ? (
+                      <Badge tone="neutral" plain>
+                        <MailIcon size={12} />
+                        {supplier.email}
+                      </Badge>
+                    ) : null}
+
+                    {supplier.address ? (
+                      <Badge tone="neutral" plain>
+                        <MapPinIcon size={12} />
+                        {supplier.address}
+                      </Badge>
+                    ) : null}
+                  </div>
+                </CardBody>
+              </Card>
+            ))}
+          </div>
+        ) : null}
+      </PageStack>
+
+      <Modal
+        open={showForm}
+        title={editingId === null ? "Add new supplier" : "Edit supplier"}
+        description="Record the vendor's company, contact and delivery details."
+        onClose={closeForm}
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeForm} disabled={saving}>
+              Cancel
+            </Button>
+
+            <Button
+              variant="primary"
+              type="submit"
+              form="supplier-form"
+              disabled={saving}
+            >
+              {saving
+                ? "Saving..."
+                : editingId === null
+                  ? "Save supplier"
+                  : "Update supplier"}
+            </Button>
+          </>
+        }
+      >
+        <form id="supplier-form" className="modal-form" onSubmit={saveSupplier}>
+          <div className="modal-body">
+            <div className="form-grid">
+              <Field label="Company name" required>
+                <Input
+                  type="text"
+                  placeholder="Enter company name"
+                  value={company}
+                  onChange={(event) => setCompany(event.target.value)}
+                  required
+                />
+              </Field>
+
+              <Field label="Contact person" required>
+                <Input
+                  type="text"
+                  placeholder="Full name"
+                  value={contact}
+                  onChange={(event) => setContact(event.target.value)}
+                  required
+                />
+              </Field>
+
+              <Field label="Phone" required>
+                <Input
+                  type="text"
+                  placeholder="0300-1234567"
+                  value={phone}
+                  onChange={(event) => setPhone(event.target.value)}
+                  required
+                />
+              </Field>
+
+              <Field label="Email">
+                <Input
+                  type="email"
+                  placeholder="supplier@email.com"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                />
+              </Field>
+
+              <Field label="Address" className="span-2">
+                <Textarea
+                  placeholder="Enter supplier address"
+                  value={address}
+                  onChange={(event) => setAddress(event.target.value)}
+                  rows={2}
+                />
+              </Field>
+            </div>
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={saving}
+        title="Delete supplier"
+        description={`"${pendingDelete?.company ?? ""}" will be permanently removed from your vendor list.`}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void deleteSupplier(pendingDelete);
+        }}
+      />
+    </main>
   );
 }
-
-export default Suppliers;

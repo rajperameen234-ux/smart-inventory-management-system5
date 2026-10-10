@@ -1,5 +1,45 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { supabase } from "../supabase";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { insertOwned, supabase } from "../supabase";
+import { useToast } from "../components/Toast";
+import {
+  AlertIcon,
+  CalendarIcon,
+  CheckCircleIcon,
+  ClockIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshIcon,
+  SearchIcon,
+  TrashIcon,
+  WalletIcon,
+} from "../components/Icon";
+import {
+  Badge,
+  Button,
+  Card,
+  CardHeader,
+  ConfirmDialog,
+  EmptyState,
+  Field,
+  Input,
+  Modal,
+  PageHeader,
+  PageStack,
+  SearchInput,
+  Select,
+  SkeletonRows,
+  StatCard,
+  type BadgeTone,
+} from "../components/ui";
+import { formatMoney, formatNumber, todayISODate } from "../lib/format";
+import { formatDate, toDateInputValue } from "../lib/date";
+import {
+  computeDueStatus,
+  resolveName,
+  roundMoney,
+  toNumber,
+  validateDue,
+} from "../lib/inventory";
 
 type Customer = {
   id: number;
@@ -17,12 +57,22 @@ type Due = {
   status: "Pending" | "Partial" | "Paid";
 };
 
-function CreditDues() {
+const STATUS_TONE: Record<Due["status"], BadgeTone> = {
+  Paid: "mint",
+  Partial: "yellow",
+  Pending: "pink",
+};
+
+export default function CreditDues() {
+  const toast = useToast();
+
   const [dues, setDues] = useState<Due[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<Due | null>(null);
 
   const [search, setSearch] = useState("");
 
@@ -32,10 +82,11 @@ function CreditDues() {
   const [dueDate, setDueDate] = useState("");
 
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   const loadAllData = async () => {
     setLoading(true);
+    setError("");
 
     const { data: customersData, error: customersError } =
       await supabase
@@ -45,8 +96,9 @@ function CreditDues() {
 
     if (customersError) {
       console.error("Customers Error:", customersError);
-      alert("Failed to load customers.");
+      setError(customersError.message);
       setLoading(false);
+      toast.error("Could not load customers", customersError.message);
       return;
     }
 
@@ -65,36 +117,32 @@ function CreditDues() {
 
     if (duesError) {
       console.error("Dues Error:", duesError);
-      alert("Failed to load dues.");
+      setError(duesError.message);
       setLoading(false);
+      toast.error("Could not load dues", duesError.message);
       return;
     }
 
     const customerList: Customer[] = customersData || [];
 
-    const mappedDues: Due[] = (duesData || []).map((item) => {
-      const customer = customerList.find(
-        (c) => c.id === item.customer_id
-      );
+    const customerNames = new Map(customerList.map((c) => [c.id, c.name]));
 
-      const statusValue =
-        item.status === "Paid" ||
-        item.status === "Partial" ||
-        item.status === "Pending"
-          ? item.status
-          : "Pending";
+    const mappedDues: Due[] = (duesData || []).map((item) => {
+      const totalDue = toNumber(item.total_due);
+      const paidAmount = toNumber(item.paid_amount);
+
+      const remainingDue = roundMoney(Math.max(0, totalDue - paidAmount));
 
       return {
-        id: item.id,
-        customerId: item.customer_id,
-        customer: customer
-          ? customer.name
-          : `Customer #${item.customer_id}`,
-        totalDue: Number(item.total_due) || 0,
-        paidAmount: Number(item.paid_amount) || 0,
-        remainingDue: Number(item.remaining_due) || 0,
-        dueDate: item.due_date || "",
-        status: statusValue,
+        id: toNumber(item.id),
+        customerId: toNumber(item.customer_id),
+        customer: resolveName(customerNames, item.customer_id, "Customer"),
+        totalDue,
+        paidAmount,
+        remainingDue,
+        dueDate: String(item.due_date ?? ""),
+        // Derived from the amounts rather than trusting the stored label.
+        status: computeDueStatus(totalDue, paidAmount),
       };
     });
 
@@ -104,7 +152,7 @@ function CreditDues() {
   };
 
   useEffect(() => {
-    loadAllData();
+    void loadAllData();
   }, []);
 
   const openAddForm = () => {
@@ -112,7 +160,7 @@ function CreditDues() {
     setCustomerId("");
     setTotalDue("");
     setPaidAmount("");
-    setDueDate(new Date().toISOString().split("T")[0]);
+    setDueDate(todayISODate());
     setShowForm(true);
   };
 
@@ -121,61 +169,38 @@ function CreditDues() {
     setCustomerId(due.customerId.toString());
     setTotalDue(due.totalDue.toString());
     setPaidAmount(due.paidAmount.toString());
-    setDueDate(due.dueDate);
+    // Normalised so a stored timestamp cannot render as an empty date field.
+    setDueDate(toDateInputValue(due.dueDate));
     setShowForm(true);
   };
 
   const closeForm = () => {
     setShowForm(false);
     setEditingId(null);
-    setCustomerId("");
-    setTotalDue("");
-    setPaidAmount("");
-    setDueDate("");
+    setSaving(false);
   };
 
-  const saveDue = async (e: FormEvent) => {
-    e.preventDefault();
+  const saveDue = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
 
-    if (!customerId) {
-      alert("Please select a customer.");
+    if (saving) return;
+
+    const issues = validateDue({
+      customerId,
+      totalDue,
+      paidAmount,
+      dueDate,
+    });
+
+    if (issues.length > 0) {
+      toast.error(issues[0].message);
       return;
     }
 
-    if (!totalDue || Number(totalDue) <= 0) {
-      alert("Please enter total due amount.");
-      return;
-    }
-
-    const total = Number(totalDue);
-    const paid = Number(paidAmount) || 0;
-
-    if (paid < 0) {
-      alert("Paid amount cannot be negative.");
-      return;
-    }
-
-    if (paid > total) {
-      alert("Paid amount cannot be greater than total due.");
-      return;
-    }
-
-    if (!dueDate) {
-      alert("Please select due date.");
-      return;
-    }
-
-    const remaining = total - paid;
-
-    let status: Due["status"];
-
-    if (remaining === 0) {
-      status = "Paid";
-    } else if (paid > 0) {
-      status = "Partial";
-    } else {
-      status = "Pending";
-    }
+    const total = toNumber(totalDue);
+    const paid = toNumber(paidAmount);
+    const remaining = roundMoney(Math.max(0, total - paid));
+    const status = computeDueStatus(total, paid);
 
     const dueData = {
       customer_id: Number(customerId),
@@ -189,348 +214,387 @@ function CreditDues() {
     setSaving(true);
 
     if (editingId !== null) {
-      const { error } = await supabase
+      const { data: updatedRows, error: updateError } = await supabase
         .from("dues")
         .update(dueData)
-        .eq("id", editingId);
+        .eq("id", editingId)
+        .select("id");
 
-      if (error) {
-        console.error("Update Due Error:", error);
-        alert("Failed to update due.");
+      if (updateError) {
+        console.error("Update Due Error:", updateError);
+        toast.error("Could not update due", updateError.message);
         setSaving(false);
         return;
       }
 
-      alert("Due updated successfully.");
+      if (!updatedRows || updatedRows.length === 0) {
+        toast.error(
+          "Credit record was not saved",
+          "No matching row was updated. It may have been deleted, or your account may not have permission to edit it."
+        );
+        setSaving(false);
+        return;
+      }
+
+      toast.success("Due updated successfully");
     } else {
-      const { error } = await supabase
-        .from("dues")
-        .insert([dueData]);
+      const { error: insertError } = await insertOwned("dues", [dueData]);
 
-      if (error) {
-        console.error("Add Due Error:", error);
-        alert("Failed to add due.");
+      if (insertError) {
+        console.error("Add Due Error:", insertError);
+        toast.error("Could not add due", insertError.message);
         setSaving(false);
         return;
       }
 
-      alert("Due added successfully.");
+      toast.success("Due added successfully");
     }
 
     await loadAllData();
-
-    setSaving(false);
     closeForm();
   };
 
-  const deleteDue = async (id: number) => {
-    if (
-      window.confirm(
-        "Are you sure you want to delete this due?"
-      )
-    ) {
-      const { error } = await supabase
-        .from("dues")
-        .delete()
-        .eq("id", id);
+  const deleteDue = async (due: Due) => {
+    setSaving(true);
 
-      if (error) {
-        console.error("Delete Due Error:", error);
-        alert("Failed to delete due.");
-        return;
-      }
+    const { error: deleteError } = await supabase
+      .from("dues")
+      .delete()
+      .eq("id", due.id)
+      .select("id");
 
-      await loadAllData();
-      alert("Due deleted successfully.");
+    setSaving(false);
+    setPendingDelete(null);
+
+    if (deleteError) {
+      console.error("Delete Due Error:", deleteError);
+      toast.error("Could not delete due", deleteError.message);
+      return;
     }
+
+    await loadAllData();
+    toast.success("Due deleted successfully");
   };
 
-  const filteredDues = dues.filter((due) =>
-    due.customer
-      .toLowerCase()
-      .includes(search.toLowerCase())
-  );
+  const filteredDues = useMemo(() => {
+    const term = search.toLowerCase().trim();
 
-  const totalOutstanding = dues.reduce(
-    (sum, due) => sum + due.remainingDue,
-    0
-  );
+    if (!term) return dues;
 
-  const totalPaid = dues.reduce(
-    (sum, due) => sum + due.paidAmount,
+    return dues.filter((due) => due.customer.toLowerCase().includes(term));
+  }, [dues, search]);
+
+  const summary = useMemo(() => {
+    let outstanding = 0;
+    let paid = 0;
+    let pending = 0;
+    let settled = 0;
+
+    dues.forEach((due) => {
+      outstanding += due.remainingDue;
+      paid += due.paidAmount;
+
+      if (due.status === "Pending") pending += 1;
+      if (due.status === "Paid") settled += 1;
+    });
+
+    return { outstanding, paid, pending, settled };
+  }, [dues]);
+
+  const previewRemaining = Math.max(
+    (Number(totalDue) || 0) - (Number(paidAmount) || 0),
     0
   );
 
   return (
-    <div className="dues-page">
-      <div className="dues-header">
-        <div>
-          <h1>Credit / Dues</h1>
-          <p>Manage customer credit and outstanding payments</p>
-        </div>
+    <main className="page-content">
+      <PageStack>
+        <PageHeader
+          title="Credit & Dues"
+          description="Track customer credit balances and the payments against them."
+          actions={
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => void loadAllData()}
+                disabled={loading}
+              >
+                <RefreshIcon size={15} />
+                Refresh
+              </Button>
 
-        <button
-          type="button"
-          className="add-due-btn"
-          onClick={openAddForm}
-        >
-          + Add Due
-        </button>
-      </div>
+              <Button variant="primary" onClick={openAddForm}>
+                <PlusIcon size={15} />
+                Add due
+              </Button>
+            </>
+          }
+        />
 
-      <div className="dues-summary">
-        <div className="due-summary-card">
-          <div className="due-summary-icon red">💰</div>
-          <div>
-            <p>Total Outstanding</p>
-            <h2>Rs. {totalOutstanding.toLocaleString()}</h2>
-          </div>
-        </div>
-
-        <div className="due-summary-card">
-          <div className="due-summary-icon green">✓</div>
-          <div>
-            <p>Total Paid</p>
-            <h2>Rs. {totalPaid.toLocaleString()}</h2>
-          </div>
-        </div>
-
-        <div className="due-summary-card">
-          <div className="due-summary-icon blue">👥</div>
-          <div>
-            <p>Total Records</p>
-            <h2>{dues.length}</h2>
-          </div>
-        </div>
-      </div>
-
-      {showForm && (
-        <div className="due-form-card">
-          <div className="due-form-header">
-            <div>
-              <h2>
-                {editingId === null
-                  ? "Add New Due"
-                  : "Edit Due"}
-              </h2>
-
-              <p>Enter customer payment details</p>
+        {error ? (
+          <div className="alert alert-error" role="alert">
+            <AlertIcon size={16} />
+            <div className="alert-content">
+              <strong>Could not load credit records</strong>
+              {error}
             </div>
-
-            <button
-              type="button"
-              className="close-due-form"
-              onClick={closeForm}
-            >
-              ✕
-            </button>
           </div>
+        ) : null}
 
-          <form onSubmit={saveDue}>
-            <div className="due-form-grid">
-              <div className="due-form-group">
-                <label>Customer</label>
+        <div className="stat-grid">
+          <StatCard
+            label="Total outstanding"
+            value={formatMoney(summary.outstanding, 0)}
+            tone="pink"
+            icon={<AlertIcon size={16} />}
+            loading={loading}
+            meta="Awaiting collection"
+          />
 
-                <select
+          <StatCard
+            label="Total collected"
+            value={formatMoney(summary.paid, 0)}
+            tone="mint"
+            icon={<CheckCircleIcon size={16} />}
+            loading={loading}
+            meta="Payments received"
+          />
+
+          <StatCard
+            label="Awaiting payment"
+            value={formatNumber(summary.pending)}
+            tone="yellow"
+            icon={<ClockIcon size={16} />}
+            loading={loading}
+            meta="Fully unpaid records"
+          />
+
+          <StatCard
+            label="Settled records"
+            value={formatNumber(summary.settled)}
+            tone="sky"
+            icon={<WalletIcon size={16} />}
+            loading={loading}
+            meta={`${dues.length} total records`}
+          />
+        </div>
+
+        <Card>
+          <CardHeader
+            title="Credit ledger"
+            description={`${filteredDues.length} of ${dues.length} records shown`}
+            actions={
+              <SearchInput
+                value={search}
+                onChange={setSearch}
+                placeholder="Search customer..."
+                label="Search credit records"
+              />
+            }
+          />
+
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Customer</th>
+                  <th className="num">Total due</th>
+                  <th className="num">Paid</th>
+                  <th className="num">Remaining</th>
+                  <th>Due date</th>
+                  <th>Status</th>
+                  <th className="actions-cell">Actions</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {loading ? (
+                  <SkeletonRows rows={6} />
+                ) : filteredDues.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="table-empty-cell">
+                      <EmptyState
+                        icon={<SearchIcon size={20} />}
+                        title={
+                          dues.length === 0
+                            ? "No credit records"
+                            : "No records found"
+                        }
+                        description={
+                          dues.length === 0
+                            ? "Record a due when a customer buys on credit."
+                            : "Try a different customer name."
+                        }
+                        action={
+                          <Button variant="primary" onClick={openAddForm}>
+                            <PlusIcon size={15} />
+                            Add due
+                          </Button>
+                        }
+                      />
+                    </td>
+                  </tr>
+                ) : (
+                  filteredDues.map((due) => (
+                    <tr key={due.id}>
+                      <td className="cell-primary">{due.customer}</td>
+
+                      <td className="num">{formatMoney(due.totalDue)}</td>
+
+                      <td className="num money-pos">
+                        {formatMoney(due.paidAmount)}
+                      </td>
+
+                      <td className="num">
+                        {due.remainingDue > 0 ? (
+                          <span className="money-neg">
+                            {formatMoney(due.remainingDue)}
+                          </span>
+                        ) : (
+                          <span className="money-pos">Settled</span>
+                        )}
+                      </td>
+
+                      <td className="cell-muted">{formatDate(due.dueDate)}</td>
+
+                      <td>
+                        <Badge tone={STATUS_TONE[due.status]}>{due.status}</Badge>
+                      </td>
+
+                      <td className="actions-cell">
+                        <span className="row-actions">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => openEditForm(due)}
+                          >
+                            <PencilIcon size={14} />
+                            Edit
+                          </Button>
+
+                          <Button
+                            size="sm"
+                            variant="soft-danger"
+                            onClick={() => setPendingDelete(due)}
+                          >
+                            <TrashIcon size={14} />
+                          </Button>
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </PageStack>
+
+      <Modal
+        open={showForm}
+        title={editingId === null ? "Add new due" : "Edit due"}
+        description="Record how much a customer owes and how much they have paid."
+        onClose={closeForm}
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeForm} disabled={saving}>
+              Cancel
+            </Button>
+
+            <Button
+              variant="primary"
+              type="submit"
+              form="due-form"
+              disabled={saving}
+            >
+              {saving
+                ? "Saving..."
+                : editingId === null
+                  ? "Save due"
+                  : "Update due"}
+            </Button>
+          </>
+        }
+      >
+        <form id="due-form" className="modal-form" onSubmit={saveDue}>
+          <div className="modal-body">
+            <div className="form-grid">
+              <Field label="Customer" required className="span-2">
+                <Select
                   value={customerId}
-                  onChange={(e) =>
-                    setCustomerId(e.target.value)
-                  }
+                  onChange={(event) => setCustomerId(event.target.value)}
                 >
-                  <option value="">
-                    Select Customer
-                  </option>
+                  <option value="">Select customer</option>
 
                   {customers.map((customer) => (
-                    <option
-                      key={customer.id}
-                      value={customer.id}
-                    >
+                    <option key={customer.id} value={customer.id}>
                       {customer.name}
                     </option>
                   ))}
-                </select>
-              </div>
+                </Select>
+              </Field>
 
-              <div className="due-form-group">
-                <label>Total Due</label>
-
-                <input
+              <Field label="Total due (Rs.)" required>
+                <Input
                   type="number"
                   min="0"
-                  placeholder="0"
+                  placeholder="0.00"
                   value={totalDue}
-                  onChange={(e) =>
-                    setTotalDue(e.target.value)
-                  }
+                  onChange={(event) => setTotalDue(event.target.value)}
                 />
-              </div>
+              </Field>
 
-              <div className="due-form-group">
-                <label>Paid Amount</label>
-
-                <input
+              <Field
+                label="Paid amount (Rs.)"
+                hint={`Remaining: ${formatMoney(previewRemaining)}`}
+              >
+                <Input
                   type="number"
                   min="0"
-                  placeholder="0"
+                  placeholder="0.00"
                   value={paidAmount}
-                  onChange={(e) =>
-                    setPaidAmount(e.target.value)
-                  }
+                  onChange={(event) => setPaidAmount(event.target.value)}
                 />
-              </div>
+              </Field>
 
-              <div className="due-form-group">
-                <label>Due Date</label>
+              <Field label="Due date" required>
+                <span style={{ position: "relative", display: "block" }}>
+                  <span
+                    style={{
+                      position: "absolute",
+                      left: 11,
+                      top: "50%",
+                      transform: "translateY(-50%)",
+                      color: "var(--text-muted)",
+                      pointerEvents: "none",
+                    }}
+                  >
+                    <CalendarIcon size={15} />
+                  </span>
 
-                <input
-                  type="date"
-                  value={dueDate}
-                  onChange={(e) =>
-                    setDueDate(e.target.value)
-                  }
-                />
-              </div>
+                  <Input
+                    type="date"
+                    value={dueDate}
+                    onChange={(event) => setDueDate(event.target.value)}
+                    style={{ paddingLeft: 34 }}
+                  />
+                </span>
+              </Field>
             </div>
+          </div>
+        </form>
+      </Modal>
 
-            <div className="due-form-actions">
-              <button
-                type="button"
-                className="due-cancel-btn"
-                onClick={closeForm}
-              >
-                Cancel
-              </button>
-
-              <button
-                type="submit"
-                className="save-due-btn"
-                disabled={saving}
-              >
-                {saving
-                  ? "Saving..."
-                  : editingId === null
-                  ? "Save Due"
-                  : "Update Due"}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      <div className="dues-toolbar">
-        <input
-          type="text"
-          placeholder="Search customer..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-
-        <span>
-          {filteredDues.length} record
-          {filteredDues.length !== 1 ? "s" : ""}
-        </span>
-      </div>
-
-      <div className="dues-table-container">
-        <table className="dues-table">
-          <thead>
-            <tr>
-              <th>Customer</th>
-              <th>Total Due</th>
-              <th>Paid</th>
-              <th>Remaining</th>
-              <th>Due Date</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {loading ? (
-              <tr>
-                <td colSpan={7} className="no-dues">
-                  Loading dues...
-                </td>
-              </tr>
-            ) : filteredDues.length > 0 ? (
-              filteredDues.map((due) => (
-                <tr key={due.id}>
-                  <td>
-                    <strong>{due.customer}</strong>
-                  </td>
-
-                  <td>
-                    Rs. {due.totalDue.toLocaleString()}
-                  </td>
-
-                  <td>
-                    Rs. {due.paidAmount.toLocaleString()}
-                  </td>
-
-                  <td>
-                    <span
-                      className={
-                        due.remainingDue > 0
-                          ? "remaining-due"
-                          : "remaining-paid"
-                      }
-                    >
-                      Rs.{" "}
-                      {due.remainingDue.toLocaleString()}
-                    </span>
-                  </td>
-
-                  <td>{due.dueDate}</td>
-
-                  <td>
-                    <span
-                      className={`due-status ${due.status.toLowerCase()}`}
-                    >
-                      {due.status}
-                    </span>
-                  </td>
-
-                  <td>
-                    <div className="due-actions">
-                      <button
-                        type="button"
-                        className="due-edit-btn"
-                        onClick={() =>
-                          openEditForm(due)
-                        }
-                      >
-                        ✏️ Edit
-                      </button>
-
-                      <button
-                        type="button"
-                        className="due-delete-btn"
-                        onClick={() =>
-                          deleteDue(due.id)
-                        }
-                      >
-                        🗑️ Delete
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td
-                  colSpan={7}
-                  className="no-dues"
-                >
-                  No dues found.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-    </div>
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={saving}
+        title="Delete credit record"
+        description={`The record for "${pendingDelete?.customer ?? ""}" will be permanently removed.`}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void deleteDue(pendingDelete);
+        }}
+      />
+    </main>
   );
 }
-
-export default CreditDues;

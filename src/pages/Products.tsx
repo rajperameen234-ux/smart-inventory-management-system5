@@ -1,6 +1,51 @@
-
-import { useEffect, useState } from "react";
-import { supabase } from "../supabase";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { insertOwned, supabase } from "../supabase";
+import { useToast } from "../components/Toast";
+import {
+  AlertIcon,
+  BoxesIcon,
+  PackageIcon,
+  PencilIcon,
+  PlusIcon,
+  RefreshIcon,
+  SearchIcon,
+  TrashIcon,
+  WalletIcon,
+} from "../components/Icon";
+import {
+  Badge,
+  Button,
+  Card,
+  CardHeader,
+  ConfirmDialog,
+  EmptyState,
+  Field,
+  Input,
+  Modal,
+  PageHeader,
+  PageStack,
+  SearchInput,
+  Select,
+  SkeletonRows,
+  StatCard,
+  type BadgeTone,
+} from "../components/ui";
+import { formatMoney, formatNumber, toNumber } from "../lib/format";
+import {
+  mergeCategoryOptions,
+  type CategoryRecord,
+} from "../lib/categories";
+import {
+  loadCategories,
+  subscribeCategories,
+} from "../lib/categoryStore";
+import {
+  computeMarginPercent,
+  computeStockValue,
+  resolveMinimumStock,
+  resolveStockStatus,
+  validateProduct,
+} from "../lib/inventory";
 
 type Product = {
   id: number;
@@ -9,13 +54,26 @@ type Product = {
   quantity: number;
   purchasePrice: number;
   sellingPrice: number;
+  minimumStock: number;
 };
 
-function Products() {
+export default function Products({
+  searchSeed = "",
+}: {
+  searchSeed?: string;
+}) {
+  const toast = useToast();
+
   const [products, setProducts] = useState<Product[]>([]);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(searchSeed);
+  const [categoryFilter, setCategoryFilter] = useState("All Categories");
+  const [stockFilter, setStockFilter] = useState("All");
+
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const [pendingDelete, setPendingDelete] = useState<Product | null>(null);
 
   const [name, setName] = useState("");
   const [category, setCategory] = useState("Electronics");
@@ -24,54 +82,161 @@ function Products() {
   const [sellingPrice, setSellingPrice] = useState("");
 
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
-  // LOAD PRODUCTS FROM SUPABASE
+  /**
+   * Categories now come from the `categories` table. Previously this list was
+   * built only from a hardcoded array plus the names already used by
+   * products, so a category created in the Categories section never appeared
+   * here unless a product happened to use that exact name.
+   */
+  const [dbCategories, setDbCategories] = useState<CategoryRecord[]>([]);
+  const [categoriesLoading, setCategoriesLoading] = useState(true);
+  const [categoriesError, setCategoriesError] = useState("");
+
+  useEffect(() => {
+    if (searchSeed) setSearch(searchSeed);
+  }, [searchSeed]);
+
+  // Load on mount, and again whenever another screen invalidates the cache so
+  // a category created in Categories shows up without a manual page refresh.
+  useEffect(() => {
+    let active = true;
+
+    async function initialLoad() {
+      try {
+        const rows = await loadCategories();
+
+        if (active) {
+          setDbCategories(rows);
+          setCategoriesError("");
+        }
+      } catch (caught) {
+        console.error("Load Categories Error:", caught);
+
+        if (active) {
+          setCategoriesError(
+            caught instanceof Error
+              ? caught.message
+              : "Could not load categories."
+          );
+        }
+      } finally {
+        if (active) setCategoriesLoading(false);
+      }
+    }
+
+    void initialLoad();
+
+    const unsubscribe = subscribeCategories(() => {
+      if (active) void initialLoad();
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
+
   const loadProducts = async () => {
     setLoading(true);
+    setError("");
 
-    const { data, error } = await supabase
+    const { data, error: loadError } = await supabase
       .from("products")
       .select("*")
       .order("id", { ascending: true });
 
-    if (error) {
-      console.error("Load Products Error:", error);
-      alert("Failed to load products from database.");
+    if (loadError) {
+      console.error("Load Products Error:", loadError);
+      setError(loadError.message);
       setLoading(false);
+      toast.error("Could not load products", loadError.message);
       return;
     }
 
-    const formattedProducts: Product[] = (data || []).map(
-      (product) => ({
-        id: product.id,
-        name: product.name,
-        category: product.supplier || "Other",
-        quantity: Number(product.stock ?? 0),
-        purchasePrice: Number(product.purchase_price ?? 0),
-        sellingPrice: Number(product.price ?? 0),
-      })
-    );
+    const formattedProducts: Product[] = (data || []).map((product) => ({
+      id: toNumber(product.id),
+      name: product.name,
+      category: product.supplier || "Other",
+      quantity: toNumber(product.stock),
+      purchasePrice: toNumber(product.purchase_price),
+      sellingPrice: toNumber(product.price),
+      minimumStock: resolveMinimumStock(product.minimum_stock),
+    }));
 
     setProducts(formattedProducts);
     setLoading(false);
   };
 
   useEffect(() => {
-    loadProducts();
+    void loadProducts();
   }, []);
 
-  // OPEN ADD FORM
+  /**
+   * Dropdown options: database categories, names already used by products
+   * (so legacy rows stay selectable), and the built-in fallbacks — all
+   * de-duplicated case-insensitively.
+   */
+  const categories = useMemo(
+    () =>
+      mergeCategoryOptions({
+        database: dbCategories.map((category) => category.name),
+        inUse: products.map((product) => product.category),
+      }),
+    [dbCategories, products]
+  );
+
+  /**
+   * Keeps the form selection valid. A product edited after its category was
+   * renamed or removed would otherwise be assigned a different category the
+   * moment the form opens.
+   */
+  useEffect(() => {
+    if (categories.length === 0) return;
+    if (categories.some((item) => item === category)) return;
+
+    const stillInUse = products.some((product) => product.category === category);
+
+    if (!stillInUse) setCategory(categories[0]);
+  }, [categories, category, products]);
+
+  const summary = useMemo(() => {
+    let units = 0;
+    let retail = 0;
+    let cost = 0;
+
+    products.forEach((product) => {
+      units += product.quantity;
+      retail += computeStockValue(product.quantity, product.sellingPrice);
+      cost += computeStockValue(product.quantity, product.purchasePrice);
+    });
+
+    // FIX: was hardcoded to `<= 10`, which disagreed with the Dashboard and the
+    // notification bell whenever a product had its own minimum_stock.
+    const lowStock = products.filter(
+      (product) =>
+        product.quantity > 0 &&
+        resolveStockStatus(product.quantity, product.minimumStock) === "low"
+    ).length;
+
+    const outOfStock = products.filter(
+      (product) => resolveStockStatus(product.quantity, product.minimumStock) === "out"
+    ).length;
+
+    return { units, retail, cost, lowStock, outOfStock };
+  }, [products]);
+
   const openAddForm = () => {
     setEditingId(null);
     setName("");
-    setCategory("Electronics");
+    setCategory(categories[0] ?? "Electronics");
     setQuantity("");
     setPurchasePrice("");
     setSellingPrice("");
     setShowForm(true);
   };
 
-  // OPEN EDIT FORM
   const openEditForm = (product: Product) => {
     setEditingId(product.id);
     setName(product.name);
@@ -82,377 +247,573 @@ function Products() {
     setShowForm(true);
   };
 
-  // DELETE PRODUCT
-  const deleteProduct = async (id: number) => {
-    if (!window.confirm("Are you sure you want to delete this product?")) {
+  const closeForm = () => {
+    setShowForm(false);
+    setEditingId(null);
+    setSaving(false);
+  };
+
+  const deleteProduct = async (product: Product) => {
+    setSaving(true);
+
+    const { data: deletedRows, error: deleteError } = await supabase
+      .from("products")
+      .delete()
+      .eq("id", product.id)
+      .select("id");
+
+    setSaving(false);
+    setPendingDelete(null);
+
+    if (deleteError) {
+      console.error("Delete Product Error:", deleteError);
+      toast.error("Could not delete product", deleteError.message);
       return;
     }
 
-    const { error } = await supabase
-      .from("products")
-      .delete()
-      .eq("id", id);
-
-    if (error) {
-      console.error("Delete Product Error:", error);
-      alert("Failed to delete product.");
+    if (!deletedRows || deletedRows.length === 0) {
+      toast.error(
+        "Product was not deleted",
+        "No matching record was removed. It may have been deleted already, or your account may not have permission."
+      );
       return;
     }
 
     setProducts((current) =>
-      current.filter((product) => product.id !== id)
+      current.filter((item) => item.id !== product.id)
     );
 
-    alert("Product deleted successfully!");
+    toast.success("Product deleted", `${product.name} was removed.`);
   };
 
-  // SAVE / UPDATE PRODUCT
-  const saveProduct = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
+  const saveProduct = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
 
-    if (
-      !name.trim() ||
-      quantity === "" ||
-      purchasePrice === "" ||
-      sellingPrice === "" ||
-      Number(quantity) < 0 ||
-      Number(purchasePrice) < 0 ||
-      Number(sellingPrice) < 0
-    ) {
-      alert("Please enter valid values in all fields.");
+    if (saving) return;
+
+    // Shared validation with unit tests — rejects fractional quantities,
+    // negatives and empty fields before anything is written.
+    const issues = validateProduct({
+      name,
+      quantity,
+      purchasePrice,
+      sellingPrice,
+    });
+
+    if (issues.length > 0) {
+      toast.error("Check the form", issues[0].message);
       return;
     }
 
+    setSaving(true);
+
+    const stock = Number(quantity);
+
     const productDetails = {
       name: name.trim(),
-      stock: Number(quantity),
+      stock,
       price: Number(sellingPrice),
       supplier: category,
       purchase_price: Number(purchasePrice),
     };
 
-    // UPDATE EXISTING PRODUCT
     if (editingId !== null) {
-      const { error } = await supabase
+      /**
+       * FIX: `.select()` is required. Without it PostgREST answers an UPDATE
+       * that matched zero rows (which is exactly what happens when a Row
+       * Level Security policy filters the row out) with `error: null`. The
+       * previous code treated that as success, so the UI claimed an edit that
+       * was never saved. Selecting the affected row makes a 0-row update
+       * detectable and reports it honestly.
+       */
+      const { data: updatedRows, error: updateError } = await supabase
         .from("products")
         .update(productDetails)
-        .eq("id", editingId);
+        .eq("id", editingId)
+        .select("id, name, supplier, stock, price, purchase_price");
 
-      if (error) {
-        console.error("Update Product Error:", error);
-        alert(`Failed to update product: ${error.message}`);
+      if (updateError) {
+        console.error("Update Product Error:", updateError);
+        toast.error("Could not update product", updateError.message);
+        setSaving(false);
         return;
       }
+
+      if (!updatedRows || updatedRows.length === 0) {
+        console.warn("Product update matched no rows for id:", editingId);
+        toast.error(
+          "Product was not saved",
+          "No matching record was updated. It may have been deleted, or your account may not have permission to edit it."
+        );
+        setSaving(false);
+        return;
+      }
+
+      const saved = updatedRows[0];
 
       setProducts((current) =>
         current.map((product) =>
           product.id === editingId
             ? {
                 ...product,
-                name: productDetails.name,
-                category: productDetails.supplier,
-                quantity: productDetails.stock,
-                purchasePrice: productDetails.purchase_price,
-                sellingPrice: productDetails.price,
+                name: saved.name ?? productDetails.name,
+                category: saved.supplier || productDetails.supplier,
+                quantity: toNumber(saved.stock ?? productDetails.stock),
+                purchasePrice: toNumber(
+                  saved.purchase_price ?? productDetails.purchase_price
+                ),
+                sellingPrice: toNumber(saved.price ?? productDetails.price),
               }
             : product
         )
       );
 
-      alert("Product updated successfully!");
+      toast.success("Product updated", productDetails.name);
     } else {
-      // ADD NEW PRODUCT
-      const { data, error } = await supabase
-        .from("products")
-        .insert([
-          {
-            ...productDetails,
-            minimum_stock: 10,
-          },
-        ])
-        .select()
-        .single();
+      const { data, error: insertError } = await insertOwned("products", [
+        {
+          ...productDetails,
+          minimum_stock: 10,
+        },
+      ]);
 
-      if (error) {
-        console.error("Add Product Error:", error);
-        alert(`Failed to add product: ${error.message}`);
+      if (insertError) {
+        console.error("Add Product Error:", insertError);
+        toast.error("Could not add product", insertError.message);
+        setSaving(false);
         return;
       }
 
       const newProduct: Product = {
-        id: data.id,
-        name: data.name,
-        category: data.supplier || "Other",
-        quantity: Number(data.stock ?? 0),
-        purchasePrice: Number(data.purchase_price ?? 0),
-        sellingPrice: Number(data.price ?? 0),
+        id: toNumber(data?.id),
+        name: data?.name ?? productDetails.name,
+        category: data?.supplier || "Other",
+        quantity: toNumber(data?.stock ?? stock),
+        purchasePrice: toNumber(data?.purchase_price),
+        sellingPrice: toNumber(data?.price),
+        minimumStock: resolveMinimumStock(data?.minimum_stock),
       };
 
       setProducts((current) => [...current, newProduct]);
-      alert("Product added successfully!");
+      toast.success("Product added", newProduct.name);
     }
 
     closeForm();
   };
 
-  // CLOSE FORM
-  const closeForm = () => {
-    setShowForm(false);
-    setEditingId(null);
-  };
+  const filteredProducts = useMemo(() => {
+    const term = search.toLowerCase().trim();
 
-  // SEARCH PRODUCTS
-  const filteredProducts = products.filter((product) =>
-    product.name.toLowerCase().includes(search.toLowerCase())
-  );
+    return products.filter((product) => {
+      const matchesSearch =
+        term.length === 0 ||
+        product.name.toLowerCase().includes(term) ||
+        product.category.toLowerCase().includes(term);
+
+      // Case-insensitive: options are de-duplicated case-insensitively, so an exact
+      // comparison would hide products whose stored name differs only in case.
+      const matchesCategory =
+        categoryFilter === "All Categories" ||
+        product.category.toLowerCase() === categoryFilter.toLowerCase();
+
+      const status = resolveStockStatus(product.quantity, product.minimumStock);
+
+      const matchesStock =
+        stockFilter === "All" ||
+        (stockFilter === "Low" && status === "low") ||
+        (stockFilter === "Out" && status === "out") ||
+        (stockFilter === "Healthy" && status === "healthy");
+
+      return matchesSearch && matchesCategory && matchesStock;
+    });
+  }, [products, search, categoryFilter, stockFilter]);
 
   return (
-    <div className="products-page">
-      {/* HEADER */}
-      <div className="products-header">
-        <div>
-          <h1>Products</h1>
-          <p>Manage your inventory products</p>
-        </div>
-
-        <button
-          type="button"
-          onClick={openAddForm}
-          style={{
-            position: "relative",
-            zIndex: 9999,
-            padding: "15px 25px",
-            background: "blue",
-            color: "white",
-            border: "none",
-            cursor: "pointer",
-            fontSize: "16px",
-          }}
-        >
-          + Add Product
-        </button>
-      </div>
-
-      {/* ADD / EDIT FORM */}
-      {showForm && (
-        <div className="product-form-card">
-          <div className="form-header">
-            <div>
-              <h2>
-                {editingId === null
-                  ? "Add New Product"
-                  : "Edit Product"}
-              </h2>
-              <p>Enter product information</p>
-            </div>
-
-            <button
-              type="button"
-              className="close-form"
-              onClick={closeForm}
-            >
-              ✕
-            </button>
-          </div>
-
-          <form onSubmit={saveProduct}>
-            <div className="form-grid">
-              <div className="form-group">
-                <label>Product Name</label>
-                <input
-                  type="text"
-                  placeholder="Enter product name"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Category</label>
-                <select
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                >
-                  <option>Electronics</option>
-                  <option>Accessories</option>
-                  <option>Furniture</option>
-                  <option>Stationery</option>
-                  <option>Other</option>
-                </select>
-              </div>
-
-              <div className="form-group">
-                <label>Quantity</label>
-                <input
-                  type="number"
-                  min="0"
-                  placeholder="Enter quantity"
-                  value={quantity}
-                  onChange={(e) => setQuantity(e.target.value)}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Purchase Price (Rs.)</label>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  placeholder="Enter purchase price"
-                  value={purchasePrice}
-                  onChange={(e) =>
-                    setPurchasePrice(e.target.value)
-                  }
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Selling Price (Rs.)</label>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  placeholder="Enter selling price"
-                  value={sellingPrice}
-                  onChange={(e) =>
-                    setSellingPrice(e.target.value)
-                  }
-                  required
-                />
-              </div>
-            </div>
-
-            <div className="form-actions">
-              <button
-                type="button"
-                className="cancel-btn"
-                onClick={closeForm}
+    <main className="page-content">
+      <PageStack>
+        <PageHeader
+          title="Products"
+          description="Manage pricing, categories and stock levels for every item you sell."
+          actions={
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => void loadProducts()}
+                disabled={loading}
               >
-                Cancel
-              </button>
+                <RefreshIcon size={15} />
+                Refresh
+              </Button>
 
-              <button type="submit" className="save-product-btn">
-                {editingId === null
-                  ? "Save Product"
-                  : "Update Product"}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* SEARCH AND CATEGORY FILTER */}
-      <div className="products-toolbar">
-        <input
-          type="text"
-          placeholder="🔍 Search products..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
+              <Button variant="primary" onClick={openAddForm}>
+                <PlusIcon size={15} />
+                Add product
+              </Button>
+            </>
+          }
         />
 
-        <select
-          onChange={(e) => {
-            // Category filtering is not applied in this version.
-            // The category dropdown remains available in the UI.
-            void e;
-          }}
-          defaultValue="All Categories"
-        >
-          <option>All Categories</option>
-          <option>Electronics</option>
-          <option>Accessories</option>
-          <option>Furniture</option>
-          <option>Stationery</option>
-          <option>Other</option>
-        </select>
-      </div>
+        {error ? (
+          <div className="alert alert-error" role="alert">
+            <AlertIcon size={16} />
+            <div className="alert-content">
+              <strong>Could not load products</strong>
+              {error}
+            </div>
+          </div>
+        ) : null}
 
-      {/* PRODUCTS TABLE */}
-      <div className="products-table-container">
-        <table className="products-table">
-          <thead>
-            <tr>
-              <th>Product</th>
-              <th>Category</th>
-              <th>Stock</th>
-              <th>Purchase Price</th>
-              <th>Selling Price</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
+        {categoriesError ? (
+          <div className="alert alert-warning" role="status">
+            <AlertIcon size={16} />
+            <div className="alert-content">
+              <strong>Categories could not be loaded</strong>
+              {categoriesError} You can still use the built-in categories.
+            </div>
+          </div>
+        ) : null}
 
-          <tbody>
-            {loading ? (
-              <tr>
-                <td colSpan={7} className="no-products">
-                  Loading products...
-                </td>
-              </tr>
-            ) : filteredProducts.length === 0 ? (
-              <tr>
-                <td colSpan={7} className="no-products">
-                  No products found
-                </td>
-              </tr>
-            ) : (
-              filteredProducts.map((product) => (
-                <tr key={product.id}>
-                  <td>
-                    <strong>{product.name}</strong>
-                  </td>
+        <div className="stat-grid">
+          <StatCard
+            label="Catalogue"
+            value={formatNumber(products.length)}
+            tone="lavender"
+            icon={<PackageIcon size={16} />}
+            loading={loading}
+            meta="Active products"
+          />
 
-                  <td>{product.category}</td>
-                  <td>{product.quantity}</td>
+          <StatCard
+            label="Units on hand"
+            value={formatNumber(summary.units)}
+            tone="mint"
+            icon={<BoxesIcon size={16} />}
+            loading={loading}
+            meta="Across every product"
+          />
 
-                  <td>
-                    Rs. {product.purchasePrice.toLocaleString()}
-                  </td>
+          <StatCard
+            label="Retail value"
+            value={formatMoney(summary.retail, 0)}
+            tone="sky"
+            icon={<WalletIcon size={16} />}
+            loading={loading}
+            meta={`${formatMoney(summary.cost, 0)} at cost`}
+          />
 
-                  <td>
-                    Rs. {product.sellingPrice.toLocaleString()}
-                  </td>
+          <StatCard
+            label="Needs restock"
+            value={formatNumber(summary.lowStock + summary.outOfStock)}
+            tone="yellow"
+            icon={<AlertIcon size={16} />}
+            loading={loading}
+            meta={`${summary.outOfStock} out of stock`}
+          />
+        </div>
 
-                  <td>
-                    {product.quantity <= 10 ? (
-                      <span className="status low-stock">
-                        Low Stock
-                      </span>
-                    ) : (
-                      <span className="status in-stock">
-                        In Stock
-                      </span>
-                    )}
-                  </td>
+        <Card>
+          <CardHeader
+            title="Product catalogue"
+            description="Search, filter and manage everything you stock."
+            actions={
+              <div className="toolbar" style={{ justifyContent: "flex-end" }}>
+                <SearchInput
+                  value={search}
+                  onChange={setSearch}
+                  placeholder="Search products..."
+                  label="Search products"
+                />
 
-                  <td className="action-buttons">
-                    <button
-                      type="button"
-                      className="edit-btn"
-                      onClick={() => openEditForm(product)}
-                    >
-                      ✏️ Edit
-                    </button>
+                <Select
+                  value={categoryFilter}
+                  onChange={(event) => setCategoryFilter(event.target.value)}
+                  aria-label="Filter by category"
+                  disabled={categoriesLoading}
+                  style={{ width: "auto", minWidth: 150 }}
+                >
+                  <option>All Categories</option>
+                  {categories.map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </Select>
 
-                    <button
-                      type="button"
-                      className="delete-btn"
-                      onClick={() => deleteProduct(product.id)}
-                    >
-                      🗑️ Delete
-                    </button>
-                  </td>
+                <Select
+                  value={stockFilter}
+                  onChange={(event) => setStockFilter(event.target.value)}
+                  aria-label="Filter by stock status"
+                  style={{ width: "auto", minWidth: 130 }}
+                >
+                  <option value="All">All stock</option>
+                  <option value="Healthy">In stock</option>
+                  <option value="Low">Low stock</option>
+                  <option value="Out">Out of stock</option>
+                </Select>
+              </div>
+            }
+          />
+
+          <div className="table-wrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>Category</th>
+                  <th className="num">Stock</th>
+                  <th className="num">Purchase price</th>
+                  <th className="num">Selling price</th>
+                  <th className="num">Margin</th>
+                  <th>Status</th>
+                  <th className="actions-cell">Actions</th>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
-    </div>
+              </thead>
+
+              <tbody>
+                {loading ? (
+                  <SkeletonRows rows={6} />
+                ) : filteredProducts.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="table-empty-cell">
+                      <EmptyState
+                        icon={<SearchIcon size={20} />}
+                        title="No products found"
+                        description={
+                          products.length === 0
+                            ? "Add your first product to start tracking inventory."
+                            : "Try adjusting your search or filter selection."
+                        }
+                        action={
+                          <Button variant="primary" onClick={openAddForm}>
+                            <PlusIcon size={15} />
+                            Add product
+                          </Button>
+                        }
+                      />
+                    </td>
+                  </tr>
+                ) : (
+                  filteredProducts.map((product) => {
+                    const margin = computeMarginPercent(
+                      product.purchasePrice,
+                      product.sellingPrice
+                    );
+
+                    const status = resolveStockStatus(
+                      product.quantity,
+                      product.minimumStock
+                    );
+
+                    const tone: BadgeTone =
+                      status === "out"
+                        ? "danger"
+                        : status === "low"
+                          ? "yellow"
+                          : "mint";
+
+                    const statusLabel =
+                      status === "out"
+                        ? "Out of stock"
+                        : status === "low"
+                          ? "Low stock"
+                          : "In stock";
+
+                    return (
+                      <tr key={product.id}>
+                        <td className="cell-primary">{product.name}</td>
+
+                        <td>
+                          <Badge tone="lavender" plain>
+                            {product.category}
+                          </Badge>
+                        </td>
+
+                        <td className="num cell-strong">{product.quantity}</td>
+
+                        <td className="num">
+                          {formatMoney(product.purchasePrice)}
+                        </td>
+
+                        <td className="num cell-strong">
+                          {formatMoney(product.sellingPrice)}
+                        </td>
+
+                        <td className="num">
+                          <span
+                            className={
+                              margin > 0 ? "money-pos" : "cell-muted"
+                            }
+                          >
+                            {margin.toFixed(1)}%
+                          </span>
+                        </td>
+
+                        <td>
+                          <Badge tone={tone}>{statusLabel}</Badge>
+                        </td>
+
+                        <td className="actions-cell">
+                          <span className="row-actions">
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => openEditForm(product)}
+                            >
+                              <PencilIcon size={14} />
+                              Edit
+                            </Button>
+
+                            <Button
+                              size="sm"
+                              variant="soft-danger"
+                              onClick={() => setPendingDelete(product)}
+                            >
+                              <TrashIcon size={14} />
+                            </Button>
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="card-footer">
+            <span className="toolbar-count">
+              Showing {filteredProducts.length} of {products.length} products
+            </span>
+          </div>
+        </Card>
+      </PageStack>
+
+      <Modal
+        open={showForm}
+        title={editingId === null ? "Add new product" : "Edit product"}
+        description={
+          editingId === null
+            ? "Create a new item in your catalogue."
+            : "Update the details of this product."
+        }
+        onClose={closeForm}
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeForm} disabled={saving}>
+              Cancel
+            </Button>
+
+            {/*
+              FIX (critical): this button previously carried BOTH
+              `type="submit"` AND `onClick={closeForm}`. React fired the click
+              first, which unmounted the modal and therefore the
+              <form id="product-form">, so the browser never dispatched a
+              submit event and `saveProduct` never ran. Adding and editing
+              products silently did nothing — no network request, no error.
+              A submit button must not also close the form.
+            */}
+            <Button
+              variant="primary"
+              type="submit"
+              form="product-form"
+              disabled={saving}
+            >
+              {saving
+                ? "Saving..."
+                : editingId === null
+                  ? "Save product"
+                  : "Update product"}
+            </Button>
+          </>
+        }
+      >
+        <form id="product-form" className="modal-form" onSubmit={saveProduct}>
+          <div className="modal-body">
+            <div className="form-grid">
+              <Field label="Product name" required className="span-2">
+                <Input
+                  type="text"
+                  placeholder="e.g. Wireless Keyboard"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  required
+                />
+              </Field>
+
+              <Field
+                label="Category"
+                required
+                hint={
+                  categoriesLoading
+                    ? "Loading categories..."
+                    : categories.length === 0
+                      ? "No categories available. Add one from the Categories page."
+                      : `${categories.length} available`
+                }
+              >
+                <Select
+                  value={category}
+                  onChange={(event) => setCategory(event.target.value)}
+                  disabled={categoriesLoading || categories.length === 0}
+                >
+                  {categories.map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </Select>
+              </Field>
+
+              <Field label="Quantity" required hint="Whole units only.">
+                <Input
+                  type="number"
+                  min="0"
+                  step="1"
+                  placeholder="0"
+                  value={quantity}
+                  onChange={(event) => setQuantity(event.target.value)}
+                  required
+                />
+              </Field>
+
+              <Field label="Purchase price (Rs.)" required>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={purchasePrice}
+                  onChange={(event) => setPurchasePrice(event.target.value)}
+                  required
+                />
+              </Field>
+
+              <Field
+                label="Selling price (Rs.)"
+                required
+                hint="The price shown to customers."
+              >
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={sellingPrice}
+                  onChange={(event) => setSellingPrice(event.target.value)}
+                  required
+                />
+              </Field>
+            </div>
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={saving}
+        title="Delete product"
+        description={`This permanently removes "${pendingDelete?.name ?? ""}" from your catalogue. This action cannot be undone.`}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void deleteProduct(pendingDelete);
+        }}
+      />
+    </main>
   );
 }
-
-export default Products;
