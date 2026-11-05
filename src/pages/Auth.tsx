@@ -286,7 +286,7 @@ export default function Auth() {
             </button>
           </form>
 
-          <div className="auth-footer">
+<div className="auth-footer">
             {mode === "login" && (
               <>
                 {"Don't have an account? "}
@@ -304,43 +304,52 @@ export default function Auth() {
               </>
             )}
             {mode === "signup" && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMode("login");
-                  setEmail("");
-                  setPassword("");
-                  setConfirmPassword("");
-                }}
-              >
-                Back to sign in
-              </button>
+              <>
+                {"Back to sign in? "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("login");
+                    setEmail("");
+                    setPassword("");
+                    setConfirmPassword("");
+                  }}
+                >
+                  Back to sign in
+                </button>
+              </>
             )}
             {mode === "forgot" && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMode("login");
-                  setEmail("");
-                  setPassword("");
-                  setConfirmPassword("");
-                }}
-              >
-                Back to sign in
-              </button>
+              <>
+                {"Back to sign in? "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("login");
+                    setEmail("");
+                    setPassword("");
+                    setConfirmPassword("");
+                  }}
+                >
+                  Back to sign in
+                </button>
+              </>
             )}
             {mode === "reset" && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMode("login");
-                  setEmail("");
-                  setPassword("");
-                  setConfirmPassword("");
-                }}
-              >
-                Back to sign in
-              </button>
+              <>
+                {"Back to login? "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("login");
+                    setEmail("");
+                    setPassword("");
+                    setConfirmPassword("");
+                  }}
+                >
+                  Back to sign in
+                </button>
+              </>
             )}
             <button
               type="button"
