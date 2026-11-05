@@ -18,13 +18,18 @@ import Sales from "./pages/Sales";
 import CreditDues from "./pages/CreditDues";
 import Reports from "./pages/Reports";
 import Settings from "./pages/Settings";
+import ResetPassword from "./pages/ResetPassword";
 
 function readPageFromHash(): PageId {
   if (typeof window === "undefined") return DEFAULT_PAGE;
 
   const hash = window.location.hash.replace(/^#\/?/, "").trim();
 
-  return isPageId(hash) ? hash : DEFAULT_PAGE;
+  if (isPageId(hash)) return hash;
+
+  if (hash === "reset-password") return "reset-password" as PageId;
+
+  return DEFAULT_PAGE;
 }
 
 function useCurrentUserEmail(): string {
@@ -122,6 +127,7 @@ export default function App() {
       {currentPage === "reports" ? <Reports /> : null}
 
       {currentPage === "settings" ? <Settings /> : null}
+      {currentPage === "reset-password" ? <ResetPassword /> : null}
     </AppShell>
   );
 }

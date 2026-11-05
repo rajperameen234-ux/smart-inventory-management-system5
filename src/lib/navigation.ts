@@ -20,7 +20,8 @@ export type PageId =
   | "sales"
   | "dues"
   | "reports"
-  | "settings";
+  | "settings"
+  | "reset-password";
 
 export type NavIcon = ComponentType<{ size?: number }>;
 

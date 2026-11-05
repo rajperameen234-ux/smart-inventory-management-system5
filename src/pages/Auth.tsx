@@ -26,12 +26,15 @@ const HIGHLIGHTS = [
 ];
 
 export default function Auth() {
-  const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [mode, setMode] = useState<"login" | "signup" | "forgot" | "reset">(
+    "login"
+  );
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -41,7 +44,7 @@ export default function Auth() {
     setLoading(true);
 
     try {
-      if (isLogin) {
+      if (mode === "login") {
         const { error: signInError } =
           await supabase.auth.signInWithPassword({
             email,
@@ -49,7 +52,7 @@ export default function Auth() {
           });
 
         if (signInError) throw signInError;
-      } else {
+      } else if (mode === "signup") {
         const { data, error: signUpError } = await supabase.auth.signUp({
           email,
           password,
@@ -57,17 +60,38 @@ export default function Auth() {
 
         if (signUpError) throw signUpError;
 
+        if (data.user) {
+          (supabase.auth as any).signInWithPassword({ email, password });
+        }
+
+        setMessage("Account created successfully! You are now logged in.");
+      } else if (mode === "forgot") {
+        (supabase.auth as any).signInWithOtp({
+          email,
+          redirectTo: window.location.origin + "/#/reset-password",
+        });
+
         setMessage(
-          data.session
-            ? "Account created successfully!"
-            : "Account created. Please check your email to confirm."
+          "Check your email for password reset instructions. After clicking the link, you'll be taken to the reset password page."
         );
+      } else if (mode === "reset") {
+        if (password !== confirmPassword) {
+          throw new Error("Passwords do not match.");
+        }
+
+        (supabase.auth as any).updatePassword(password);
+
+        setMessage(
+          "Password updated successfully! You can now log in with your new password."
+        );
+        setMode("login");
+        setEmail("");
+        setPassword("");
+        setConfirmPassword("");
       }
     } catch (caught) {
       setError(
-        caught instanceof Error
-          ? caught.message
-          : "Something went wrong. Please try again."
+        caught instanceof Error ? caught.message : "Something went wrong."
       );
     } finally {
       setLoading(false);
@@ -141,12 +165,8 @@ export default function Auth() {
       <main className="auth-main">
         <div className="auth-card">
           <header>
-            <h1>{isLogin ? "Welcome back" : "Create your account"}</h1>
-            <p>
-              {isLogin
-                ? "Sign in to continue to your inventory workspace."
-                : "Get started with your own secure workspace in seconds."}
-            </p>
+            <h1>{getModeTitle(mode)}</h1>
+            <p>{getModeDescription(mode)}</p>
           </header>
 
           <form onSubmit={handleSubmit} className="auth-fields">
@@ -180,6 +200,38 @@ export default function Auth() {
               </span>
             </div>
 
+            {mode === "reset" && (
+              <div className="field">
+                <span className="label">Confirm Password</span>
+
+                <span style={{ position: "relative", display: "block" }}>
+                  <span
+                    style={{
+                      position: "absolute",
+                      left: 11,
+                      top: "50%",
+                      transform: "translateY(-50%)",
+                      color: "var(--text-muted)",
+                      pointerEvents: "none",
+                    }}
+                  >
+                    <LockIcon size={15} />
+                  </span>
+
+                  <input
+                    type="password"
+                    className="input"
+                    value={confirmPassword}
+                    onChange={(event) => setConfirmPassword(event.target.value)}
+                    placeholder="Confirm your password"
+                    required
+                    autoComplete="new-password"
+                    style={{ paddingLeft: 34 }}
+                  />
+                </span>
+              </div>
+            )}
+
             <div className="field">
               <span className="label">Password</span>
 
@@ -202,12 +254,10 @@ export default function Auth() {
                   className="input"
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
-                  placeholder="At least 6 characters"
+                  placeholder={mode === "reset" ? "Enter new password" : "At least 6 characters"}
                   minLength={6}
                   required
-                  autoComplete={
-                    isLogin ? "current-password" : "new-password"
-                  }
+                  autoComplete={mode === "reset" ? "new-password" : "new-password"}
                   style={{ paddingLeft: 34 }}
                 />
               </span>
@@ -232,30 +282,106 @@ export default function Auth() {
               disabled={loading}
               style={{ height: 40 }}
             >
-              {loading
-                ? "Please wait..."
-                : isLogin
-                  ? "Sign in to workspace"
-                  : "Create account"}
+              {loading ? "Please wait..." : getButtonLabel(mode)}
             </button>
           </form>
 
           <div className="auth-footer">
-            {isLogin ? "Don't have an account? " : "Already have an account? "}
-
+            {mode === "login" && (
+              <>
+                {"Don't have an account? "}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("signup");
+                    setEmail("");
+                    setPassword("");
+                    setConfirmPassword("");
+                  }}
+                >
+                  Create account
+                </button>
+              </>
+            )}
+            {mode === "signup" && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMode("login");
+                  setEmail("");
+                  setPassword("");
+                  setConfirmPassword("");
+                }}
+              >
+                Back to sign in
+              </button>
+            )}
+            {mode === "forgot" && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMode("login");
+                  setEmail("");
+                  setPassword("");
+                  setConfirmPassword("");
+                }}
+              >
+                Back to sign in
+              </button>
+            )}
+            {mode === "reset" && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMode("login");
+                  setEmail("");
+                  setPassword("");
+                  setConfirmPassword("");
+                }}
+              >
+                Back to sign in
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {
-                setIsLogin(!isLogin);
-                setMessage("");
-                setError("");
+                setMode("forgot");
+                setEmail("");
               }}
             >
-              {isLogin ? "Create account" : "Back to sign in"}
+              Forgot Password?
             </button>
           </div>
         </div>
       </main>
     </div>
   );
+}
+
+function getModeTitle(mode: "login" | "signup" | "forgot" | "reset"): string {
+  if (mode === "login" || mode === "forgot") return "Welcome back";
+  if (mode === "signup") return "Create your account";
+  if (mode === "reset") return "Reset Password";
+  return "Welcome back";
+}
+
+function getModeDescription(mode: "login" | "signup" | "forgot" | "reset"): string {
+  if (mode === "login") {
+    return "Sign in to continue to your inventory workspace.";
+  }
+  if (mode === "signup") {
+    return "Get started with your own secure workspace in seconds.";
+  }
+  if (mode === "forgot") {
+    return "Enter your registered email address to begin the password reset process.";
+  }
+  return "Enter a new password to reset your account password.";
+}
+
+function getButtonLabel(mode: "login" | "signup" | "forgot" | "reset"): string {
+  if (mode === "login") return "Sign in to workspace";
+  if (mode === "signup") return "Create account";
+  if (mode === "forgot") return "Send reset link";
+  if (mode === "reset") return "Update password";
+  return "Create account";
 }
