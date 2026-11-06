@@ -30,7 +30,7 @@ import {
   StatCard,
   type BadgeTone,
 } from "../components/ui";
-import { formatMoney, formatNumber, toNumber } from "../lib/format";
+import { formatDate, formatMoney, formatNumber, toNumber } from "../lib/format";
 import {
   mergeCategoryOptions,
   type CategoryRecord,
@@ -44,6 +44,7 @@ import {
   computeStockValue,
   resolveMinimumStock,
   resolveStockStatus,
+  roundMoney,
   validateProduct,
 } from "../lib/inventory";
 
@@ -51,10 +52,12 @@ type Product = {
   id: number;
   name: string;
   category: string;
+  sku: string | null;
   quantity: number;
   purchasePrice: number;
   sellingPrice: number;
   minimumStock: number;
+  createdAt: string;
 };
 
 export default function Products({
@@ -77,9 +80,13 @@ export default function Products({
 
   const [name, setName] = useState("");
   const [category, setCategory] = useState("Electronics");
+  const [sku, setSku] = useState("");
   const [quantity, setQuantity] = useState("");
   const [purchasePrice, setPurchasePrice] = useState("");
   const [sellingPrice, setSellingPrice] = useState("");
+  const [minimumStock, setMinimumStock] = useState("10");
+
+  const [detailProduct, setDetailProduct] = useState<Product | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -159,10 +166,12 @@ export default function Products({
       id: toNumber(product.id),
       name: product.name,
       category: product.supplier || "Other",
+      sku: product.sku ? String(product.sku) : null,
       quantity: toNumber(product.stock),
       purchasePrice: toNumber(product.purchase_price),
       sellingPrice: toNumber(product.price),
       minimumStock: resolveMinimumStock(product.minimum_stock),
+      createdAt: String(product.created_at ?? ""),
     }));
 
     setProducts(formattedProducts);
@@ -231,9 +240,11 @@ export default function Products({
     setEditingId(null);
     setName("");
     setCategory(categories[0] ?? "Electronics");
+    setSku("");
     setQuantity("");
     setPurchasePrice("");
     setSellingPrice("");
+    setMinimumStock("10");
     setShowForm(true);
   };
 
@@ -241,9 +252,11 @@ export default function Products({
     setEditingId(product.id);
     setName(product.name);
     setCategory(product.category);
+    setSku(product.sku ?? "");
     setQuantity(String(product.quantity));
     setPurchasePrice(String(product.purchasePrice));
     setSellingPrice(String(product.sellingPrice));
+    setMinimumStock(String(product.minimumStock));
     setShowForm(true);
   };
 
@@ -298,11 +311,32 @@ export default function Products({
       quantity,
       purchasePrice,
       sellingPrice,
+        minimumStock,
     });
 
     if (issues.length > 0) {
       toast.error("Check the form", issues[0].message);
       return;
+    }
+
+    // Prevent accidental duplicate SKUs (case-insensitive) within the shop.
+    const trimmedSku = sku.trim();
+
+    if (trimmedSku) {
+      const duplicate = products.find(
+        (product) =>
+          product.id !== editingId &&
+          Boolean(product.sku) &&
+          product.sku?.toLowerCase() === trimmedSku.toLowerCase()
+      );
+
+      if (duplicate) {
+        toast.error(
+          "SKU already in use",
+          `"${trimmedSku}" is already assigned to ${duplicate.name}.`
+        );
+        return;
+      }
     }
 
     setSaving(true);
@@ -315,6 +349,8 @@ export default function Products({
       price: Number(sellingPrice),
       supplier: category,
       purchase_price: Number(purchasePrice),
+      sku: trimmedSku ? trimmedSku : null,
+      minimum_stock: Math.max(0, Math.floor(Number(minimumStock) || 0)),
     };
 
     if (editingId !== null) {
@@ -330,7 +366,9 @@ export default function Products({
         .from("products")
         .update(productDetails)
         .eq("id", editingId)
-        .select("id, name, supplier, stock, price, purchase_price");
+        .select(
+          "id, name, supplier, stock, price, purchase_price, sku, minimum_stock"
+        );
 
       if (updateError) {
         console.error("Update Product Error:", updateError);
@@ -358,11 +396,13 @@ export default function Products({
                 ...product,
                 name: saved.name ?? productDetails.name,
                 category: saved.supplier || productDetails.supplier,
+                sku: saved.sku ?? null,
                 quantity: toNumber(saved.stock ?? productDetails.stock),
                 purchasePrice: toNumber(
                   saved.purchase_price ?? productDetails.purchase_price
                 ),
                 sellingPrice: toNumber(saved.price ?? productDetails.price),
+                minimumStock: resolveMinimumStock(saved.minimum_stock),
               }
             : product
         )
@@ -371,10 +411,7 @@ export default function Products({
       toast.success("Product updated", productDetails.name);
     } else {
       const { data, error: insertError } = await insertOwned("products", [
-        {
-          ...productDetails,
-          minimum_stock: 10,
-        },
+        productDetails,
       ]);
 
       if (insertError) {
@@ -388,10 +425,14 @@ export default function Products({
         id: toNumber(data?.id),
         name: data?.name ?? productDetails.name,
         category: data?.supplier || "Other",
+        sku: data?.sku ? String(data.sku) : null,
         quantity: toNumber(data?.stock ?? stock),
         purchasePrice: toNumber(data?.purchase_price),
         sellingPrice: toNumber(data?.price),
         minimumStock: resolveMinimumStock(data?.minimum_stock),
+        createdAt: String(
+          (data as unknown as Record<string, unknown> | null)?.created_at ?? ""
+        ),
       };
 
       setProducts((current) => [...current, newProduct]);
@@ -427,6 +468,23 @@ export default function Products({
       return matchesSearch && matchesCategory && matchesStock;
     });
   }, [products, search, categoryFilter, stockFilter]);
+
+  /** Live form previews: profit per unit and the automatic purchase total. */
+  const profitPerUnitPreview = roundMoney(
+    toNumber(sellingPrice) - toNumber(purchasePrice)
+  );
+
+  const quantityTotal = Math.max(0, Math.floor(Number(quantity) || 0));
+
+  const totalPurchasePreview = computeStockValue(
+    quantityTotal,
+    purchasePrice === "" ? 0 : purchasePrice
+  );
+
+  const detailValue =
+    detailProduct !== null
+      ? computeStockValue(detailProduct.quantity, detailProduct.purchasePrice)
+      : 0;
 
   return (
     <main className="page-content">
@@ -558,10 +616,11 @@ export default function Products({
                 <tr>
                   <th>Product</th>
                   <th>Category</th>
-                  <th className="num">Stock</th>
                   <th className="num">Purchase price</th>
                   <th className="num">Selling price</th>
-                  <th className="num">Margin</th>
+                  <th className="num">Profit / unit</th>
+                  <th className="num">Available stock</th>
+                  <th className="num">Inventory value</th>
                   <th>Status</th>
                   <th className="actions-cell">Actions</th>
                 </tr>
@@ -572,7 +631,7 @@ export default function Products({
                   <SkeletonRows rows={6} />
                 ) : filteredProducts.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="table-empty-cell">
+                    <td colSpan={9} className="table-empty-cell">
                       <EmptyState
                         icon={<SearchIcon size={20} />}
                         title="No products found"
@@ -592,9 +651,15 @@ export default function Products({
                   </tr>
                 ) : (
                   filteredProducts.map((product) => {
-                    const margin = computeMarginPercent(
-                      product.purchasePrice,
-                      product.sellingPrice
+                    // Inventory value is always purchase price x current stock,
+                    // never the selling price.
+                    const profitPerUnit = roundMoney(
+                      product.sellingPrice - product.purchasePrice
+                    );
+
+                    const inventoryValue = computeStockValue(
+                      product.quantity,
+                      product.purchasePrice
                     );
 
                     const status = resolveStockStatus(
@@ -618,15 +683,27 @@ export default function Products({
 
                     return (
                       <tr key={product.id}>
-                        <td className="cell-primary">{product.name}</td>
+                        <td>
+                          <span className="cell-stack">
+                            <button
+                              type="button"
+                              className="link-button cell-primary"
+                              onClick={() => setDetailProduct(product)}
+                              title="View product details"
+                            >
+                              {product.name}
+                            </button>
+                            <small className="cell-muted">
+                              {product.sku ? `SKU: ${product.sku}` : `#${product.id}`}
+                            </small>
+                          </span>
+                        </td>
 
                         <td>
                           <Badge tone="lavender" plain>
                             {product.category}
                           </Badge>
                         </td>
-
-                        <td className="num cell-strong">{product.quantity}</td>
 
                         <td className="num">
                           {formatMoney(product.purchasePrice)}
@@ -639,11 +716,17 @@ export default function Products({
                         <td className="num">
                           <span
                             className={
-                              margin > 0 ? "money-pos" : "cell-muted"
+                              profitPerUnit > 0 ? "money-pos" : "cell-muted"
                             }
                           >
-                            {margin.toFixed(1)}%
+                            {formatMoney(profitPerUnit)}
                           </span>
+                        </td>
+
+                        <td className="num cell-strong">{product.quantity}</td>
+
+                        <td className="num">
+                          {formatMoney(inventoryValue, 0)}
                         </td>
 
                         <td>
@@ -652,6 +735,14 @@ export default function Products({
 
                         <td className="actions-cell">
                           <span className="row-actions">
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => setDetailProduct(product)}
+                            >
+                              View
+                            </Button>
+
                             <Button
                               size="sm"
                               variant="secondary"
@@ -760,7 +851,20 @@ export default function Products({
                 </Select>
               </Field>
 
-              <Field label="Quantity" required hint="Whole units only.">
+              <Field label="SKU / product code" hint="Optional part or barcode code.">
+                <Input
+                  type="text"
+                  placeholder="e.g. WM-750"
+                  value={sku}
+                  onChange={(event) => setSku(event.target.value)}
+                />
+              </Field>
+
+              <Field
+                label="Quantity (initial stock)"
+                required
+                hint="Whole units only."
+              >
                 <Input
                   type="number"
                   min="0"
@@ -772,7 +876,21 @@ export default function Products({
                 />
               </Field>
 
-              <Field label="Purchase price (Rs.)" required>
+              <Field
+                label="Minimum stock"
+                hint="Low stock alert level."
+              >
+                <Input
+                  type="number"
+                  min="0"
+                  step="1"
+                  placeholder="10"
+                  value={minimumStock}
+                  onChange={(event) => setMinimumStock(event.target.value)}
+                />
+              </Field>
+
+              <Field label="Purchase price per unit (Rs.)" required>
                 <Input
                   type="number"
                   min="0"
@@ -785,7 +903,7 @@ export default function Products({
               </Field>
 
               <Field
-                label="Selling price (Rs.)"
+                label="Selling price per unit (Rs.)"
                 required
                 hint="The price shown to customers."
               >
@@ -799,6 +917,23 @@ export default function Products({
                   required
                 />
               </Field>
+            </div>
+
+            <div className="calc-panel">
+              <div className="calc-row">
+                <span>Profit per unit</span>
+                <strong>{formatMoney(profitPerUnitPreview)}</strong>
+              </div>
+
+              <div className="calc-row">
+                <span>Total purchase amount ({formatNumber(quantityTotal)} units)</span>
+                <strong>{formatMoney(totalPurchasePreview, 2)}</strong>
+              </div>
+
+              <p className="calc-note">
+                Purchases total = purchase price × quantity — updates
+                automatically.
+              </p>
             </div>
           </div>
         </form>
@@ -814,6 +949,110 @@ export default function Products({
           if (pendingDelete) void deleteProduct(pendingDelete);
         }}
       />
+
+      <Modal
+        open={detailProduct !== null}
+        title={detailProduct?.name ?? "Product details"}
+        description="Current product information and stock position."
+        onClose={() => setDetailProduct(null)}
+        footer={
+          <Button
+            variant="primary"
+            onClick={() => {
+              if (detailProduct) openEditForm(detailProduct);
+              setDetailProduct(null);
+            }}
+          >
+            <PencilIcon size={14} />
+            Edit product
+          </Button>
+        }
+      >
+        {detailProduct ? (
+          <div className="modal-body">
+            <div className="calc-panel">
+              <div className="calc-row">
+                <span>Current inventory value</span>
+                <strong>{formatMoney(detailValue)}</strong>
+              </div>
+
+              <p className="calc-note">
+                Purchase price × current stock — stock on hand is always
+                valued at cost, never at the selling price.
+              </p>
+            </div>
+
+            <dl className="detail-list">
+              <div className="detail-item">
+                <dt>Product name</dt>
+                <dd>{detailProduct.name}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Category</dt>
+                <dd>{detailProduct.category}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>SKU / product code</dt>
+                <dd>{detailProduct.sku || "—"}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Purchase price</dt>
+                <dd>{formatMoney(detailProduct.purchasePrice)}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Selling price</dt>
+                <dd>{formatMoney(detailProduct.sellingPrice)}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Profit per unit</dt>
+                <dd className="money-pos">
+                  {formatMoney(
+                    roundMoney(
+                      detailProduct.sellingPrice - detailProduct.purchasePrice
+                    )
+                  )}
+                </dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Margin</dt>
+                <dd>
+                  {computeMarginPercent(
+                    detailProduct.purchasePrice,
+                    detailProduct.sellingPrice
+                  ).toFixed(1)}
+                  %
+                </dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Available quantity</dt>
+                <dd>{detailProduct.quantity}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Minimum stock</dt>
+                <dd>{detailProduct.minimumStock}</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Supplier records</dt>
+                <dd>Managed on the Suppliers page</dd>
+              </div>
+
+              <div className="detail-item">
+                <dt>Product created</dt>
+                <dd>{formatDate(detailProduct.createdAt)}</dd>
+              </div>
+            </dl>
+          </div>
+        ) : null}
+      </Modal>
     </main>
   );
 }

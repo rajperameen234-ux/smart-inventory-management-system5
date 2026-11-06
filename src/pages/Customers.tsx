@@ -3,6 +3,7 @@ import { insertOwned, supabase } from "../supabase";
 import { useToast } from "../components/Toast";
 import {
   AlertIcon,
+  EyeIcon,
   MailIcon,
   MapPinIcon,
   PencilIcon,
@@ -31,8 +32,12 @@ import {
   SkeletonRows,
   StatCard,
   Textarea,
+  type BadgeTone,
 } from "../components/ui";
 import { formatMoney, formatNumber, initials, toNumber } from "../lib/format";
+import { formatDate } from "../lib/date";
+import { roundMoney } from "../lib/inventory";
+import { computePaymentStatus, type PaymentStatus } from "../lib/profit";
 
 type Customer = {
   id: number;
@@ -40,9 +45,213 @@ type Customer = {
   phone: string;
   email: string;
   address: string;
+  /** Computed from real sales, never typed in. */
   totalPurchases: number;
+  totalPaid: number;
   dues: number;
+  lastPurchase: string | null;
+  salesCount: number;
+  status: PaymentStatus;
 };
+
+function statusTone(status: PaymentStatus): BadgeTone {
+  if (status === "Paid") return "mint";
+  if (status === "Partial") return "yellow";
+  return "pink";
+}
+
+type DetailSale = {
+  id: number;
+  quantity: number;
+  totalAmount: number;
+  paidAmount: number;
+  productName: string;
+  date: string;
+  status: PaymentStatus;
+};
+
+type DetailPayment = {
+  id: number;
+  amount: number;
+  paidAt: string;
+  note: string;
+};
+
+/** Loads a customer's sale history inside the details modal. */
+function DetailPurchases({ customerId }: { customerId: number }) {
+  const [rows, setRows] = useState<DetailSale[] | null>(null);
+  const [fetchError, setFetchError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setRows(null);
+    setFetchError("");
+
+    void supabase
+      .from("sales")
+      .select(`
+        id, quantity, total_amount, paid_amount, sale_date, product_name,
+        products(name)
+      `)
+      .eq("customer_id", customerId)
+      .order("sale_date", { ascending: false })
+      .then(({ data, error: loadError }) => {
+        if (!active) return;
+
+        if (loadError) {
+          console.error("Customer detail sales error:", loadError);
+          setFetchError(loadError.message);
+          return;
+        }
+
+        setRows(
+          (data ?? []).map((row) => {
+            const joined = (row as { products?: { name: unknown }[] }).products;
+            const linkedName = joined?.[0]?.name;
+
+            return {
+              id: toNumber(row.id),
+              quantity: toNumber(row.quantity),
+              totalAmount: toNumber(row.total_amount),
+              paidAmount: toNumber(row.paid_amount),
+              productName:
+                row.product_name ??
+                (linkedName ? String(linkedName) : "Product"),
+              date: String(row.sale_date ?? ""),
+              status: computePaymentStatus(
+                toNumber(row.total_amount),
+                toNumber(row.paid_amount)
+              ),
+            };
+          })
+        );
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [customerId]);
+
+  if (fetchError) {
+    return (
+      <p className="detail-error">Purchase history unavailable: {fetchError}</p>
+    );
+  }
+
+  if (rows === null) return <SkeletonRows rows={3} />;
+
+  if (rows.length === 0) {
+    return <p className="detail-empty">No recorded purchases yet.</p>;
+  }
+
+  return (
+    <div className="purchase-history">
+      {rows.map((row) => (
+        <div className="purchase-history-row" key={row.id}>
+          <div className="purchase-history-main">
+            <strong>{row.productName}</strong>
+            <small>
+              {formatDate(row.date)} · Qty {formatNumber(row.quantity)}
+            </small>
+          </div>
+
+          <div className="purchase-history-side">
+            <span className="cell-strong">{formatMoney(row.totalAmount)}</span>
+            <Badge tone={statusTone(row.status)}>{row.status}</Badge>
+            {row.totalAmount - row.paidAmount > 0.009 ? (
+              <small className="detail-due">
+                Due {formatMoney(row.totalAmount - row.paidAmount)}
+              </small>
+            ) : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Loads a customer's payment ledger inside the details modal. */
+function DetailPayments({ customerId }: { customerId: number }) {
+  const [rows, setRows] = useState<DetailPayment[] | null>(null);
+  const [hasLedger, setHasLedger] = useState(true);
+  const [fetchError, setFetchError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setRows(null);
+    setHasLedger(true);
+    setFetchError("");
+
+    void supabase
+      .from("payments")
+      .select("id, amount, paid_at, note")
+      .eq("customer_id", customerId)
+      .order("paid_at", { ascending: false })
+      .then(({ data, error: loadError }) => {
+        if (!active) return;
+
+        if (loadError) {
+          if (
+            loadError.message.toLowerCase().includes("could not find the table")
+          ) {
+            setHasLedger(false);
+            return;
+          }
+
+          console.error("Customer detail payments error:", loadError);
+          setFetchError(loadError.message);
+          return;
+        }
+
+        setRows(
+          (data ?? []).map((row) => ({
+            id: toNumber(row.id),
+            amount: toNumber(row.amount),
+            paidAt: String(row.paid_at ?? ""),
+            note: String(row.note ?? ""),
+          }))
+        );
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [customerId]);
+
+  if (!hasLedger) {
+    return (
+      <p className="detail-error">
+        Payment history requires the database migration (payments ledger table).
+      </p>
+    );
+  }
+
+  if (fetchError) {
+    return (
+      <p className="detail-error">Payment history unavailable: {fetchError}</p>
+    );
+  }
+
+  if (rows === null) return <SkeletonRows rows={2} />;
+
+  if (rows.length === 0) {
+    return <p className="detail-empty">No payments recorded yet.</p>;
+  }
+
+  return (
+    <div className="payment-history">
+      {rows.map((row) => (
+        <div className="payment-history-row" key={row.id}>
+          <div className="payment-history-main">
+            <strong className="money-pos">+ {formatMoney(row.amount)}</strong>
+            <small>{formatDate(row.paidAt.slice(0, 10))}</small>
+          </div>
+          {row.note ? <small className="cell-muted">{row.note}</small> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function Customers({
   searchSeed = "",
@@ -59,13 +268,12 @@ export default function Customers({
   const [saving, setSaving] = useState(false);
 
   const [pendingDelete, setPendingDelete] = useState<Customer | null>(null);
+  const [detailTarget, setDetailTarget] = useState<Customer | null>(null);
 
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [email, setEmail] = useState("");
   const [address, setAddress] = useState("");
-  const [totalPurchases, setTotalPurchases] = useState("");
-  const [dues, setDues] = useState("");
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -78,28 +286,82 @@ export default function Customers({
     setLoading(true);
     setError("");
 
-    const { data, error: loadError } = await supabase
-      .from("customers")
-      .select("*")
-      .order("id", { ascending: true });
+    const [customersResult, salesResult] = await Promise.all([
+      supabase.from("customers").select(`
+        id, name, phone, email, address
+      `).order("id", { ascending: true }),
 
-    if (loadError) {
-      console.error("Load Customers Error:", loadError);
-      setError(loadError.message);
+      supabase.from("sales").select(`
+        id, customer_id, total_amount, paid_amount, sale_date
+      `).order("id", { ascending: true }),
+    ]);
+
+    const failure = customersResult.error ?? salesResult.error;
+
+    if (failure) {
+      console.error("Load Customers Error:", failure);
+      setError(failure.message);
       setLoading(false);
-      toast.error("Could not load customers", loadError.message);
+      toast.error("Could not load customers", failure.message);
       return;
     }
 
-    const formattedCustomers: Customer[] = (data || []).map((customer) => ({
-      id: customer.id,
-      name: customer.name,
-      phone: customer.phone || "",
-      email: customer.email || "",
-      address: customer.address || "",
-      totalPurchases: toNumber(customer.total_purchases),
-      dues: toNumber(customer.dues),
-    }));
+    // The payments ledger is supplementary — a missing table must not blank
+    // the customer list; the detail modal reports it contextually.
+
+    // Balances are aggregated from the customer's actual sales so the numbers
+    // can never disagree with the Sales or Credit & Dues pages.
+    const balances = new Map<
+      number,
+      { purchases: number; paid: number; last: string | null; count: number }
+    >();
+
+    (salesResult.data ?? []).forEach((row) => {
+      const id = toNumber(row.customer_id);
+      const total = toNumber(row.total_amount);
+      const paid = toNumber(row.paid_amount);
+      const date = String(row.sale_date ?? "");
+
+      const existing = balances.get(id) ?? {
+        purchases: 0,
+        paid: 0,
+        last: null,
+        count: 0,
+      };
+
+      balances.set(id, {
+        purchases: roundMoney(existing.purchases + total),
+        paid: roundMoney(existing.paid + paid),
+        last:
+          existing.last && existing.last > date ? existing.last : date || existing.last,
+        count: existing.count + 1,
+      });
+    });
+
+    const formattedCustomers: Customer[] = (customersResult.data || []).map(
+      (customer) => {
+        const balance = balances.get(toNumber(customer.id)) ?? {
+          purchases: 0,
+          paid: 0,
+          last: null,
+          count: 0,
+        };
+
+        return {
+          id: toNumber(customer.id),
+          name: customer.name,
+          phone: customer.phone || "",
+          email: customer.email || "",
+          address: customer.address || "",
+          totalPurchases: balance.purchases,
+          totalPaid: balance.paid,
+          dues: Math.max(0, roundMoney(balance.purchases - balance.paid)),
+          lastPurchase: balance.last,
+          salesCount: balance.count,
+          status: computePaymentStatus(balance.purchases, balance.paid),
+        };
+      }
+    );
 
     setCustomers(formattedCustomers);
     setLoading(false);
@@ -115,8 +377,6 @@ export default function Customers({
     setPhone("");
     setEmail("");
     setAddress("");
-    setTotalPurchases("");
-    setDues("");
     setShowForm(true);
   };
 
@@ -126,8 +386,6 @@ export default function Customers({
     setPhone(customer.phone);
     setEmail(customer.email);
     setAddress(customer.address);
-    setTotalPurchases(customer.totalPurchases.toString());
-    setDues(customer.dues.toString());
     setShowForm(true);
   };
 
@@ -137,16 +395,17 @@ export default function Customers({
     setSaving(false);
   };
 
+  // Only contact details are editable here. Balances are owned by the sales
+  // records, so this form must never overwrite total_purchases/dues.
   const customerPayload = () => ({
     name: name.trim(),
     phone: phone.trim(),
     email: email.trim(),
     address: address.trim(),
-    // Balances are money: clamped so a hand-typed negative or an
-    // over-collection can never be stored.
-    total_purchases: Math.max(0, toNumber(totalPurchases)),
-    dues: Math.max(0, toNumber(dues)),
   });
+
+  /** Quick guard used before destructive actions. */
+  const hasSales = (customer: Customer) => customer.salesCount > 0;
 
   const saveCustomer = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -199,8 +458,6 @@ export default function Customers({
                 phone: customerData.phone,
                 email: customerData.email,
                 address: customerData.address,
-                totalPurchases: customerData.total_purchases,
-                dues: customerData.dues,
               }
             : customer
         )
@@ -219,18 +476,22 @@ export default function Customers({
         return;
       }
 
-// Prefer the row the database returned; fall back to the submitted values so
+      // Prefer the row the database returned; fall back to the submitted values so
       // the list still updates correctly if only a subset of columns is returned.
-      const row = (data ?? customerData) as Record<string, unknown>;
+      const row = (data ?? { id: null, ...customerData }) as Record<string, unknown>;
 
       const newCustomer: Customer = {
         id: toNumber(row.id),
         name: String(row.name ?? customerData.name),
-        phone: String(row.phone ?? ""),
-        email: String(row.email ?? ""),
-        address: String(row.address ?? ""),
-        totalPurchases: toNumber(row.total_purchases),
-        dues: toNumber(row.dues),
+        phone: String(row.phone ?? customerData.phone),
+        email: String(row.email ?? customerData.email),
+        address: String(row.address ?? customerData.address),
+        totalPurchases: 0,
+        totalPaid: 0,
+        dues: 0,
+        lastPurchase: null,
+        salesCount: 0,
+        status: "Unpaid",
       };
 
       setCustomers((current) => [...current, newCustomer]);
@@ -241,6 +502,16 @@ export default function Customers({
   };
 
   const deleteCustomer = async (customer: Customer) => {
+    // linked records: refuse instead of silently orphaning them.
+    if (hasSales(customer)) {
+      setPendingDelete(null);
+      toast.error(
+        "Customer has sales",
+        `Delete or reassign the ${customer.salesCount} sale(s) linked to ${customer.name} first — deleting is blocked to protect your records.`
+      );
+      return;
+    }
+
     setSaving(true);
 
     const { error: deleteError } = await supabase
@@ -377,10 +648,11 @@ export default function Customers({
                 <tr>
                   <th>Customer</th>
                   <th>Phone</th>
-                  <th>Email</th>
-                  <th>Address</th>
-                  <th className="num">Total purchases</th>
+                  <th className="num">Billed</th>
+                  <th className="num">Paid</th>
                   <th className="num">Outstanding</th>
+                  <th>Last purchase</th>
+                  <th>Status</th>
                   <th className="actions-cell">Actions</th>
                 </tr>
               </thead>
@@ -390,7 +662,7 @@ export default function Customers({
                   <SkeletonRows rows={6} />
                 ) : filteredCustomers.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="table-empty-cell">
+                    <td colSpan={8} className="table-empty-cell">
                       <EmptyState
                         icon={<SearchIcon size={20} />}
                         title={
@@ -433,32 +705,14 @@ export default function Customers({
                         </span>
                       </td>
 
-                      <td>{customer.phone || "â€”"}</td>
-
-                      <td>
-                        {customer.email ? (
-                          <a
-                            href={`mailto:${customer.email}`}
-                            style={{ fontSize: 13 }}
-                          >
-                            {customer.email}
-                          </a>
-                        ) : (
-                          <span className="cell-muted">â€”</span>
-                        )}
-                      </td>
-
-                      <td>
-                        <span
-                          className="truncate"
-                          style={{ display: "inline-block" }}
-                        >
-                          {customer.address || "â€”"}
-                        </span>
-                      </td>
+                      <td>{customer.phone || "—"}</td>
 
                       <td className="num cell-strong">
                         {formatMoney(customer.totalPurchases)}
+                      </td>
+
+                      <td className="num">
+                        {formatMoney(customer.totalPaid)}
                       </td>
 
                       <td className="num">
@@ -471,21 +725,32 @@ export default function Customers({
                         )}
                       </td>
 
+                      <td className="cell-muted">
+                        {customer.lastPurchase ? formatDate(customer.lastPurchase) : "—"}
+                      </td>
+
+                      <td>
+                        <Badge tone={statusTone(customer.status)}>
+                          {customer.status}
+                        </Badge>
+                      </td>
+
                       <td className="actions-cell">
                         <span className="row-actions">
                           <Button
                             size="sm"
                             variant="secondary"
-                            onClick={() => openEditForm(customer)}
+                            onClick={() => setDetailTarget(customer)}
                           >
-                            <PencilIcon size={14} />
-                            Edit
+                            <EyeIcon size={14} />
+                            Details
                           </Button>
 
                           <Button
                             size="sm"
                             variant="soft-danger"
                             onClick={() => setPendingDelete(customer)}
+                            disabled={hasSales(customer)}
                           >
                             <TrashIcon size={14} />
                           </Button>
@@ -566,7 +831,7 @@ export default function Customers({
       <Modal
         open={showForm}
         title={editingId === null ? "Add new customer" : "Edit customer"}
-        description="Capture contact details and their account balances."
+        description="Contact details only — balances are tracked automatically from sales and payments."
         onClose={closeForm}
         footer={
           <>
@@ -629,32 +894,108 @@ export default function Customers({
                   rows={2}
                 />
               </Field>
-
-              <Field label="Total purchases (Rs.)" hint="Lifetime billed value.">
-                <Input
-                  type="number"
-                  min="0"
-                  placeholder="0"
-                  value={totalPurchases}
-                  onChange={(event) => setTotalPurchases(event.target.value)}
-                />
-              </Field>
-
-              <Field
-                label="Outstanding dues (Rs.)"
-                hint="Amount still owed by the customer."
-              >
-                <Input
-                  type="number"
-                  min="0"
-                  placeholder="0"
-                  value={dues}
-                  onChange={(event) => setDues(event.target.value)}
-                />
-              </Field>
             </div>
+
+            <p className="calc-note">
+              Total purchases, paid amount, and dues are calculated from the
+              Sales and Credit &amp; Dues pages — no manual balance entry.
+            </p>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={detailTarget !== null}
+        title={detailTarget?.name ?? "Customer"}
+        description={`Customer #${detailTarget?.id ?? ""} — contact and financial history.`}
+        onClose={() => setDetailTarget(null)}
+        size="md"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setDetailTarget(null)}>
+              Close
+            </Button>
+
+            <Button
+              variant="primary"
+              onClick={() => {
+                if (detailTarget) {
+                  const target = detailTarget;
+                  setDetailTarget(null);
+                  openEditForm(target);
+                }
+              }}
+            >
+              <PencilIcon size={14} />
+              Edit customer
+            </Button>
+          </>
+        }
+      >
+        <div className="modal-body">
+          <div className="calc-panel">
+            <div className="calc-row">
+              <span>Total purchases (billed)</span>
+              <strong>{formatMoney(detailTarget?.totalPurchases ?? 0)}</strong>
+            </div>
+
+            <div className="calc-row">
+              <span>Total paid</span>
+              <strong className="money-pos">
+                {formatMoney(detailTarget?.totalPaid ?? 0)}
+              </strong>
+            </div>
+
+            <div className="calc-row calc-total">
+              <span>Outstanding dues</span>
+              <strong>{formatMoney(detailTarget?.dues ?? 0)}</strong>
+            </div>
+          </div>
+
+          <div className="detail-list">
+            <div className="detail-item">
+              <span>Phone</span>
+              <strong>{detailTarget?.phone || "—"}</strong>
+            </div>
+
+            <div className="detail-item">
+              <span>Email</span>
+              <strong>{detailTarget?.email || "—"}</strong>
+            </div>
+
+            <div className="detail-item detail-item-wide">
+              <span>Address</span>
+              <strong>{detailTarget?.address || "—"}</strong>
+            </div>
+
+            <div className="detail-item">
+              <span>Recorded sales</span>
+              <strong>{formatNumber(detailTarget?.salesCount ?? 0)}</strong>
+            </div>
+
+            <div className="detail-item">
+              <span>Last purchase</span>
+              <strong>
+                {detailTarget?.lastPurchase
+                  ? formatDate(detailTarget.lastPurchase)
+                  : "—"}
+              </strong>
+            </div>
+
+            <div className="detail-item">
+              <span>Status</span>
+              <Badge tone={statusTone(detailTarget?.status ?? "Unpaid")}>
+                {detailTarget?.status ?? "—"}
+              </Badge>
+            </div>
+          </div>
+
+          <h4 className="detail-subheading">Purchase history</h4>
+          {detailTarget ? <DetailPurchases customerId={detailTarget.id} /> : null}
+
+          <h4 className="detail-subheading">Payment history</h4>
+          {detailTarget ? <DetailPayments customerId={detailTarget.id} /> : null}
+        </div>
       </Modal>
 
       <ConfirmDialog

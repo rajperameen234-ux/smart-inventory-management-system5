@@ -120,6 +120,8 @@ export function validateProduct(input: {
   quantity: string;
   purchasePrice: string;
   sellingPrice: string;
+  /** Optional: the product's own low-stock threshold. */
+  minimumStock?: string;
 }): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -140,6 +142,19 @@ export function validateProduct(input: {
     issues.push({ field: "quantity", message: "Quantity cannot be negative." });
   }
 
+  if (
+    input.minimumStock !== undefined &&
+    input.minimumStock !== "" &&
+    (!Number.isFinite(Number(input.minimumStock)) ||
+      Number(input.minimumStock) < 0 ||
+      !Number.isInteger(Number(input.minimumStock)))
+  ) {
+    issues.push({
+      field: "minimumStock",
+      message: "Minimum stock must be a whole number of 0 or more.",
+    });
+  }
+
   for (const [field, value, label] of [
     ["purchasePrice", input.purchasePrice, "Purchase price"],
     ["sellingPrice", input.sellingPrice, "Selling price"],
@@ -157,8 +172,44 @@ export function validateProduct(input: {
 }
 
 /**
+ * Full sale money math from the frontend inputs:
+ *   subtotal  = selling price × quantity
+ *   discount  = clamped to [0, subtotal]
+ *   final     = subtotal − discount
+ *   due       = final − paid (paid clamped to [0, final])
+ * Everything is rounded to money so UI and database cannot drift apart.
+ */
+export function computeSaleAmounts(input: {
+  unitPrice: unknown;
+  quantity: unknown;
+  discount: unknown;
+  paid: unknown;
+}): {
+  subtotal: number;
+  discount: number;
+  final: number;
+  paid: number;
+  due: number;
+} {
+  const subtotal = roundMoney(
+    Math.max(0, toNumber(input.unitPrice)) * Math.max(0, toNumber(input.quantity))
+  );
+
+  const discount = Math.max(0, Math.min(roundMoney(toNumber(input.discount)), subtotal));
+  const final = roundMoney(subtotal - discount);
+  const paid = Math.min(Math.max(0, toNumber(input.paid)), final);
+  const due = roundMoney(final - paid);
+
+  return { subtotal, discount, final, paid, due };
+}
+
+/**
  * Validate a sale payload. `availableStock` is the product's current stock; the
  * new quantity is checked against it so stock can never go negative.
+ *
+ * When `unitPrice`/`discount` are provided (new sale flow) the derived amounts
+ * are validated too: no negative price, no discount larger than the subtotal
+ * and a final amount that is still greater than zero.
  */
 export function validateSale(input: {
   customerId: string;
@@ -168,6 +219,8 @@ export function validateSale(input: {
   paidAmount: string;
   date: string;
   availableStock?: number;
+  unitPrice?: string;
+  discount?: string;
 }): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -223,6 +276,44 @@ export function validateSale(input: {
     issues.push({ field: "date", message: "Select the sale date." });
   } else if (!parseDate(input.date)) {
     issues.push({ field: "date", message: "Sale date is not a valid date." });
+  }
+
+  if (input.unitPrice !== undefined) {
+    const unitPrice = Number(input.unitPrice);
+
+    if (input.unitPrice === "" || !Number.isFinite(unitPrice) || unitPrice < 0) {
+      issues.push({
+        field: "unitPrice",
+        message: "Enter a valid selling price per unit.",
+      });
+    }
+
+    if (Number.isFinite(quantity) && quantity > 0 && Number.isFinite(unitPrice)) {
+      const amounts = computeSaleAmounts({
+        unitPrice: input.unitPrice,
+        quantity: input.quantity,
+        discount: input.discount ?? 0,
+        paid: input.paidAmount === "" ? 0 : input.paidAmount,
+      });
+
+      if (amounts.final <= 0) {
+        issues.push({
+          field: "totalAmount",
+          message: "The final amount after discount must be greater than 0.",
+        });
+      }
+    }
+  }
+
+  if (input.discount !== undefined && input.discount !== "") {
+    const discount = Number(input.discount);
+
+    if (!Number.isFinite(discount) || discount < 0) {
+      issues.push({
+        field: "discount",
+        message: "Discount cannot be negative.",
+      });
+    }
   }
 
   return issues;

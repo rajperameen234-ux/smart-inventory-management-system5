@@ -16,6 +16,7 @@ import Suppliers from "./pages/Suppliers";
 import Customers from "./pages/Customers";
 import Sales from "./pages/Sales";
 import CreditDues from "./pages/CreditDues";
+import Profit from "./pages/Profit";
 import Reports from "./pages/Reports";
 import Settings from "./pages/Settings";
 import ResetPassword from "./pages/ResetPassword";
@@ -123,6 +124,8 @@ export default function App() {
       {currentPage === "sales" ? <Sales /> : null}
 
       {currentPage === "dues" ? <CreditDues /> : null}
+
+      {currentPage === "profit" ? <Profit /> : null}
 
       {currentPage === "reports" ? <Reports /> : null}
 

@@ -72,6 +72,24 @@ export type InsertResult<T> = {
 };
 
 /**
+ * True when PostgREST answered "unknown function" for an RPC call. Used to
+ * detect a database that has not migrated to the transactional sale/payment
+ * functions yet, so the client can fall back to its non-transactional writes
+ * instead of dead-ending.
+ */
+export function isMissingFunction(error: { message?: string } | null): boolean {
+  if (!error) return false;
+
+  const message = String(error.message ?? "").toLowerCase();
+
+  return (
+    (message.includes("could not find") && message.includes("function")) ||
+    message.includes("no function matches") ||
+    message.includes("unknown function")
+  );
+}
+
+/**
  * Insert that automatically stamps `user_id`.
  *
  * If the column rejects the value (a project without it, or a differently

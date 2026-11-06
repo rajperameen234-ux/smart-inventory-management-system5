@@ -35,11 +35,23 @@ import { formatMoney, formatNumber, todayISODate } from "../lib/format";
 import { formatDate, toDateInputValue } from "../lib/date";
 import {
   computeLineTotals,
+  computeSaleAmounts,
   computeSaleStockEffects,
   resolveName,
+  roundMoney,
   toNumber,
   validateSale,
 } from "../lib/inventory";
+import { isMissingFunction } from "../supabase";
+import { computePaymentStatus, type PaymentStatus } from "../lib/profit";
+
+type PaymentStatusLabel = PaymentStatus;
+
+const STATUS_TONE: Record<PaymentStatusLabel, "mint" | "yellow" | "pink"> = {
+  Paid: "mint",
+  Partial: "yellow",
+  Unpaid: "pink",
+};
 
 type Sale = {
   id: number;
@@ -47,11 +59,16 @@ type Sale = {
   productId: number;
   customer: string;
   product: string;
+  productName: string;
   quantity: number;
+  unitPrice: number | null;
+  unitCost: number | null;
+  discount: number;
   totalAmount: number;
   paidAmount: number;
   dueAmount: number;
   date: string;
+  status: PaymentStatusLabel;
 };
 
 type Customer = {
@@ -63,6 +80,8 @@ type Product = {
   id: number;
   name: string;
   stock: number;
+  sellingPrice: number;
+  purchasePrice: number;
 };
 
 export default function Sales() {
@@ -82,9 +101,15 @@ export default function Sales() {
   const [customerId, setCustomerId] = useState("");
   const [productId, setProductId] = useState("");
   const [quantity, setQuantity] = useState("");
-  const [totalAmount, setTotalAmount] = useState("");
+  const [unitPrice, setUnitPrice] = useState("");
+  const [discount, setDiscount] = useState("");
   const [paidAmount, setPaidAmount] = useState("");
   const [date, setDate] = useState("");
+
+  // History filters: text, payment status and an inclusive date range.
+  const [statusFilter, setStatusFilter] = useState("All");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -108,7 +133,7 @@ export default function Sales() {
 
         supabase
           .from("products")
-          .select("id, name, stock")
+          .select("id, name, stock, price, purchase_price")
           .order("id", { ascending: true }),
 
         supabase
@@ -121,7 +146,11 @@ export default function Sales() {
             total_amount,
             paid_amount,
             due_amount,
-            sale_date
+            sale_date,
+            unit_price,
+            unit_cost,
+            discount,
+            product_name
           `)
           .order("id", { ascending: true }),
       ]);
@@ -141,6 +170,8 @@ export default function Sales() {
         id: toNumber(product.id),
         name: String(product.name ?? ""),
         stock: toNumber(product.stock),
+        sellingPrice: toNumber(product.price),
+        purchasePrice: toNumber(product.purchase_price),
       })) satisfies Product[];
 
       const customerNames = new Map(customerList.map((c) => [c.id, c.name]));
@@ -158,11 +189,25 @@ export default function Sales() {
           productId: toNumber(sale.product_id),
           customer: resolveName(customerNames, sale.customer_id, "Customer"),
           product: resolveName(productNames, sale.product_id, "Product"),
+          productName: sale.product_name
+            ? String(sale.product_name)
+            : resolveName(productNames, sale.product_id, "Product"),
           quantity: toNumber(sale.quantity),
+          unitPrice:
+            sale.unit_price === null || sale.unit_price === undefined
+              ? null
+              : toNumber(sale.unit_price),
+          unitCost:
+            sale.unit_cost === null || sale.unit_cost === undefined
+              ? null
+              : toNumber(sale.unit_cost),
+          discount: toNumber(sale.discount),
           totalAmount: total,
           paidAmount: paid,
           dueAmount: due,
           date: String(sale.sale_date ?? ""),
+          // Status is derived from the real amounts, never from a stored label.
+          status: computePaymentStatus(total, paid),
         };
       });
 
@@ -187,12 +232,13 @@ export default function Sales() {
     void loadAllData();
   }, []);
 
-  /** Current stock for the product selected in the form. */
-  const selectedStock = useMemo(() => {
-    const match = products.find((product) => product.id === Number(productId));
+  /** The product selected in the form — supplies stock and current prices. */
+  const selectedProduct = useMemo(
+    () => products.find((product) => product.id === Number(productId)),
+    [products, productId]
+  );
 
-    return match ? match.stock : undefined;
-  }, [products, productId]);
+  const selectedStock = selectedProduct ? selectedProduct.stock : undefined;
 
   /**
    * Units already committed to stock by the sale being edited. They are put
@@ -218,7 +264,8 @@ export default function Sales() {
     setCustomerId("");
     setProductId("");
     setQuantity("");
-    setTotalAmount("");
+    setUnitPrice("");
+    setDiscount("");
     setPaidAmount("");
     setDate(todayISODate());
     setShowForm(true);
@@ -233,7 +280,19 @@ export default function Sales() {
     setCustomerId(String(sale.customerId));
     setProductId(String(sale.productId));
     setQuantity(String(sale.quantity));
-    setTotalAmount(String(sale.totalAmount));
+
+    // Historical prices recorded with the sale. A legacy sale (recorded
+    // before the migration) has no stored unit price, so the effective unit
+    // price derived from its own total is pre-filled instead — the sale's
+    // actual figures are not silently reinterpreted.
+    setUnitPrice(
+      sale.unitPrice !== null
+        ? String(sale.unitPrice)
+        : sale.quantity > 0
+          ? String(roundMoney(sale.totalAmount / sale.quantity))
+          : ""
+    );
+    setDiscount(sale.discount ? String(sale.discount) : "");
     setPaidAmount(String(sale.paidAmount));
 
     // FIX: normalise the stored value for <input type="date">. A raw
@@ -290,14 +349,25 @@ export default function Sales() {
 
     if (saving || !savingRef.begin()) return;
 
+    // Money comes from the actual form inputs — selling price per unit,
+    // quantity, discount and payment.
+    const amounts = computeSaleAmounts({
+      unitPrice,
+      quantity,
+      discount: discount === "" ? 0 : discount,
+      paid: paidAmount === "" ? 0 : paidAmount,
+    });
+
     const issues = validateSale({
       customerId,
       productId,
       quantity,
-      totalAmount,
+      totalAmount: String(amounts.final),
       paidAmount,
       date,
       availableStock: availableForForm,
+      unitPrice,
+      discount,
     });
 
     if (issues.length > 0) {
@@ -307,7 +377,11 @@ export default function Sales() {
       return;
     }
 
-    const { total, paid, due } = computeLineTotals(totalAmount, paidAmount);
+    const { total, paid, due } = computeLineTotals(
+      amounts.final,
+      amounts.paid
+    );
+
     const nextQuantity = Number(quantity);
     const nextProductId = Number(productId);
 
@@ -317,17 +391,44 @@ export default function Sales() {
 
     setSaving(true);
 
-    try {
-      const saleData = {
-        customer_id: Number(customerId),
-        product_id: nextProductId,
-        quantity: nextQuantity,
-        total_amount: total,
-        paid_amount: paid,
-        due_amount: due,
-        sale_date: date,
-      };
+    // Editing a legacy sale (saved before historical prices existed) keeps its
+    // original total, so nothing currently stored is silently rewritten.
+    const legacyPreserve =
+      previous !== null &&
+      previous.unitPrice === null &&
+      previous.discount === 0 &&
+      previous.productId === nextProductId &&
+      previous.quantity === nextQuantity;
 
+    /**
+     * Snapshot of the product as the sale should remember it. Editing a sale
+     * refreshes the historical name/cost from the product it now points at;
+     * the sale's own selling price stays the user-entered one.
+     */
+    const productSnapshot = selectedProduct;
+
+    const saleData = {
+      customer_id: Number(customerId),
+      product_id: nextProductId,
+      quantity: nextQuantity,
+      total_amount: legacyPreserve && previous ? previous.totalAmount : total,
+      paid_amount: paid,
+      due_amount:
+        legacyPreserve && previous
+          ? roundMoney(previous.totalAmount - paid)
+          : due,
+      sale_date: date,
+      unit_price: Number(unitPrice),
+      unit_cost: productSnapshot
+        ? productSnapshot.purchasePrice
+        : (previous?.unitCost ?? 0),
+      discount: amounts.discount,
+      product_name: productSnapshot
+        ? productSnapshot.name
+        : (previous?.productName ?? ""),
+    };
+
+    try {
       if (editingId !== null) {
         const { data: updatedRows, error: updateError } = await supabase
           .from("sales")
@@ -381,32 +482,71 @@ export default function Sales() {
           toast.success("Sale updated successfully");
         }
       } else {
-        const { data: inserted, error: insertError } = await insertOwned("sales", [
-          saleData,
-        ]);
+        /**
+         * Preferred path: one database function inserts the sale AND deducts
+         * the stock inside a single transaction, so stock can never be
+         * deducted twice and no sale can be written with stale cost data.
+         */
+        const { data: rpcSaleId, error: rpcError } = await supabase.rpc(
+          "create_sale_with_stock",
+          {
+            p_customer_id: Number(customerId),
+            p_product_id: nextProductId,
+            p_quantity: nextQuantity,
+            p_unit_price: Number(unitPrice),
+            p_discount: amounts.discount,
+            p_paid_amount: paid,
+            p_sale_date: date,
+          }
+        );
 
-        if (insertError) {
-          console.error("Add Sale Error:", insertError);
-          toast.error("Could not add sale", insertError.message);
+        if (rpcError && !isMissingFunction(rpcError)) {
+          console.error("Create Sale RPC Error:", rpcError);
+          toast.error("Could not add sale", rpcError.message);
           return;
         }
 
-        const saleId = toNumber(inserted?.id);
+        let saleId = toNumber(rpcSaleId);
 
-        const stockError = await applyStock(
-          nextProductId,
-          computeSaleStockEffects({
-            previous: null,
-            nextProductId,
-            nextQuantity,
-          })[0].delta
-        );
+        if (rpcError || saleId === 0) {
+          // Fallback for a not-yet-migrated database: insert first, then
+          // deduct. Both steps report failures instead of hiding them.
+          if (rpcError) {
+            console.warn(
+              "create_sale_with_stock unavailable — falling back to client-side stock deduction."
+            );
+          }
 
-        if (stockError) {
-          toast.error(
-            "Sale saved, but stock was not updated",
-            "Please check this product's quantity."
+          const { data: inserted, error: insertError } = await insertOwned(
+            "sales",
+            [saleData]
           );
+
+          if (insertError) {
+            console.error("Add Sale Error:", insertError);
+            toast.error("Could not add sale", insertError.message);
+            return;
+          }
+
+          saleId = toNumber(inserted?.id);
+
+          const stockError = await applyStock(
+            nextProductId,
+            computeSaleStockEffects({
+              previous: null,
+              nextProductId,
+              nextQuantity,
+            })[0].delta
+          );
+
+          if (stockError) {
+            toast.error(
+              "Sale saved, but stock was not updated",
+              "Please check this product's quantity."
+            );
+          } else {
+            toast.success("Sale added successfully", `#${saleId}`);
+          }
         } else {
           toast.success("Sale added successfully", `#${saleId}`);
         }
@@ -431,41 +571,74 @@ export default function Sales() {
 
     setSaving(true);
 
-    const { error: deleteError } = await supabase
-      .from("sales")
-      .delete()
-      .eq("id", sale.id)
-      .select("id");
+    /**
+     * Preferred path: one database function restores the stock and deletes the
+     * sale in a single transaction, so stock is restored exactly once and any
+     * payments allocated against the sale are removed with it.
+     */
+    const { error: rpcError } = await supabase.rpc("delete_sale_and_restock", {
+      p_sale_id: sale.id,
+    });
+
+    if (rpcError && !isMissingFunction(rpcError)) {
+      console.error("Delete Sale RPC Error:", rpcError);
+      toast.error("Could not delete sale", rpcError.message);
+      savingRef.end();
+      setSaving(false);
+      setPendingDelete(null);
+      return;
+    }
+
+    let deleteError = rpcError;
+
+    if (rpcError) {
+      console.warn(
+        "delete_sale_and_restock unavailable — falling back to the client-side reversal."
+      );
+
+      // Fallback for a not-yet-migrated database.
+      const result = await supabase
+        .from("sales")
+        .delete()
+        .eq("id", sale.id)
+        .select("id");
+
+      deleteError = result.error;
+
+      if (!result.error) {
+        // Deleted sales must return their units to stock.
+        const stockError = await applyStock(
+          sale.productId,
+          computeSaleStockEffects({
+            previous: {
+              productId: sale.productId,
+              quantity: sale.quantity,
+            },
+            nextProductId: sale.productId,
+            nextQuantity: sale.quantity,
+            deleting: true,
+          })[0].delta
+        );
+
+        if (stockError) {
+          toast.error(
+            "Sale deleted, but stock was not restored",
+            "Please check this product's quantity."
+          );
+        } else {
+          toast.success("Sale deleted successfully");
+        }
+      }
+    } else {
+      toast.success("Sale deleted successfully");
+    }
 
     if (deleteError) {
       console.error("Delete Sale Error:", deleteError);
       toast.error("Could not delete sale", deleteError.message);
-    } else {
-      // Deleted sales must return their units to stock.
-      const stockError = await applyStock(
-        sale.productId,
-        computeSaleStockEffects({
-          previous: {
-            productId: sale.productId,
-            quantity: sale.quantity,
-          },
-          nextProductId: sale.productId,
-          nextQuantity: sale.quantity,
-          deleting: true,
-        })[0].delta
-      );
-
-      if (stockError) {
-        toast.error(
-          "Sale deleted, but stock was not restored",
-          "Please check this product's quantity."
-        );
-      } else {
-        toast.success("Sale deleted successfully");
-      }
-
-      await loadAllData();
     }
+
+    await loadAllData();
 
     savingRef.end();
     setSaving(false);
@@ -475,15 +648,25 @@ export default function Sales() {
   const filteredSales = useMemo(() => {
     const term = search.toLowerCase().trim();
 
-    if (!term) return sales;
+    return sales.filter((sale) => {
+      // Filter by payment status using the derived status, not a stored label.
+      const matchesStatus =
+        statusFilter === "All" || sale.status === statusFilter;
 
-    return sales.filter(
-      (sale) =>
+      // Inclusive calendar-date range, open when no bound is set.
+      const saleDay = sale.date;
+      const matchesFrom = !fromDate || saleDay >= fromDate;
+      const matchesTo = !toDate || saleDay <= toDate;
+
+      const matchesTerm =
+        term.length === 0 ||
         sale.customer.toLowerCase().includes(term) ||
         sale.product.toLowerCase().includes(term) ||
-        sale.date.toLowerCase().includes(term)
-    );
-  }, [sales, search]);
+        sale.date.toLowerCase().includes(term);
+
+      return matchesStatus && matchesFrom && matchesTo && matchesTerm;
+    });
+  }, [sales, search, statusFilter, fromDate, toDate]);
 
   const summary = useMemo(() => {
     let billed = 0;
@@ -501,7 +684,13 @@ export default function Sales() {
     return { billed, collected, due, units };
   }, [sales]);
 
-  const preview = computeLineTotals(totalAmount, paidAmount);
+  /** Live form money: subtotal, discount, final, paid and remaining due. */
+  const preview = computeSaleAmounts({
+    unitPrice,
+    quantity,
+    discount: discount === "" ? 0 : discount,
+    paid: paidAmount === "" ? 0 : paidAmount,
+  });
 
   return (
     <main className="page-content">
@@ -581,12 +770,44 @@ export default function Sales() {
             title="Sales ledger"
             description={`${filteredSales.length} of ${sales.length} transactions shown`}
             actions={
-              <SearchInput
-                value={search}
-                onChange={setSearch}
-                placeholder="Search customer, product or date..."
-                label="Search sales"
-              />
+              <div className="filter-row">
+                <SearchInput
+                  value={search}
+                  onChange={setSearch}
+                  placeholder="Search customer, product or date..."
+                  label="Search sales"
+                />
+
+                <Select
+                  value={statusFilter}
+                  onChange={(event) => setStatusFilter(event.target.value)}
+                  aria-label="Filter by payment status"
+                  style={{ width: "auto", minWidth: 130 }}
+                >
+                  <option value="All">All payments</option>
+                  <option value="Paid">Paid</option>
+                  <option value="Partial">Partially paid</option>
+                  <option value="Unpaid">Unpaid</option>
+                </Select>
+
+                <Input
+                  type="date"
+                  value={fromDate}
+                  onChange={(event) => setFromDate(event.target.value)}
+                  aria-label="Filter sales from date"
+                  style={{ width: "auto", minWidth: 140 }}
+                  title="From date"
+                />
+
+                <Input
+                  type="date"
+                  value={toDate}
+                  onChange={(event) => setToDate(event.target.value)}
+                  aria-label="Filter sales to date"
+                  style={{ width: "auto", minWidth: 140 }}
+                  title="To date"
+                />
+              </div>
             }
           />
 
@@ -597,6 +818,7 @@ export default function Sales() {
                   <th>Customer</th>
                   <th>Product</th>
                   <th className="num">Qty</th>
+                  <th className="num">Unit price</th>
                   <th className="num">Total</th>
                   <th className="num">Paid</th>
                   <th className="num">Due</th>
@@ -611,7 +833,7 @@ export default function Sales() {
                   <SkeletonRows rows={6} />
                 ) : filteredSales.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="table-empty-cell">
+                    <td colSpan={10} className="table-empty-cell">
                       <EmptyState
                         icon={<SearchIcon size={20} />}
                         title={
@@ -634,11 +856,22 @@ export default function Sales() {
                 ) : (
                   filteredSales.map((sale) => (
                     <tr key={sale.id}>
-                      <td className="cell-primary">{sale.customer}</td>
+                      <td className="cell-primary">
+                        <span className="cell-stack">
+                          <strong>{sale.customer}</strong>
+                          <small className="cell-muted">#{sale.id}</small>
+                        </span>
+                      </td>
 
-                      <td>{sale.product}</td>
+                      <td>{sale.productName}</td>
 
                       <td className="num">{sale.quantity}</td>
+
+                      <td className="num">
+                        {sale.unitPrice !== null
+                          ? formatMoney(sale.unitPrice)
+                          : <span className="cell-muted">—</span>}
+                      </td>
 
                       <td className="num cell-strong">
                         {formatMoney(sale.totalAmount)}
@@ -661,8 +894,8 @@ export default function Sales() {
                       <td className="cell-muted">{formatDate(sale.date)}</td>
 
                       <td>
-                        <Badge tone={sale.dueAmount > 0 ? "yellow" : "mint"}>
-                          {sale.dueAmount > 0 ? "Partial" : "Paid"}
+                        <Badge tone={STATUS_TONE[sale.status]}>
+                          {sale.status === "Unpaid" ? "Unpaid" : sale.status}
                         </Badge>
                       </td>
 
@@ -752,7 +985,21 @@ export default function Sales() {
               >
                 <Select
                   value={productId}
-                  onChange={(event) => setProductId(event.target.value)}
+                  onChange={(event) => {
+                    const nextId = event.target.value;
+
+                    setProductId(nextId);
+
+                    // Selecting a product loads its current selling price;
+                    // purchase prices never reach customer invoices.
+                    const product = products.find(
+                      (item) => item.id === Number(nextId)
+                    );
+
+                    if (product) {
+                      setUnitPrice(String(product.sellingPrice));
+                    }
+                  }}
                 >
                   <option value="">Select product</option>
 
@@ -772,6 +1019,36 @@ export default function Sales() {
                   placeholder="1"
                   value={quantity}
                   onChange={(event) => setQuantity(event.target.value)}
+                />
+              </Field>
+
+              <Field
+                label="Selling price per unit (Rs.)"
+                required
+                hint={
+                  selectedProduct && Number(unitPrice) === selectedProduct.sellingPrice
+                    ? "Loaded from the product's selling price."
+                    : "Pre-filled from the product — adjust only if you negotiated a different price."
+                }
+              >
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={unitPrice}
+                  onChange={(event) => setUnitPrice(event.target.value)}
+                />
+              </Field>
+
+              <Field label="Discount (Rs.)">
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0.00"
+                  value={discount}
+                  onChange={(event) => setDiscount(event.target.value)}
                 />
               </Field>
 
@@ -799,20 +1076,13 @@ export default function Sales() {
                 </span>
               </Field>
 
-              <Field label="Total amount (Rs.)" required>
-                <Input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  placeholder="0.00"
-                  value={totalAmount}
-                  onChange={(event) => setTotalAmount(event.target.value)}
-                />
-              </Field>
-
               <Field
-                label="Paid amount (Rs.)"
-                hint={`Balance after payment: ${formatMoney(preview.due)}`}
+                label="Payment received (Rs.)"
+                hint={
+                  preview.due > 0
+                    ? `Balance after payment: ${formatMoney(preview.due)}`
+                    : "Fully paid — no balance remains."
+                }
               >
                 <Input
                   type="number"
@@ -823,6 +1093,44 @@ export default function Sales() {
                   onChange={(event) => setPaidAmount(event.target.value)}
                 />
               </Field>
+            </div>
+
+            <div className="calc-panel">
+              <div className="calc-row">
+                <span>Subtotal (selling price × quantity)</span>
+                <strong>{formatMoney(preview.subtotal)}</strong>
+              </div>
+
+              <div className="calc-row">
+                <span>Discount</span>
+                <strong>
+                  {preview.discount > 0
+                    ? `− ${formatMoney(preview.discount)}`
+                    : formatMoney(0)}
+                </strong>
+              </div>
+
+              <div className="calc-row">
+                <span>Final sale amount</span>
+                <strong className="money-pos">
+                  {formatMoney(preview.final)}
+                </strong>
+              </div>
+
+              <div className="calc-row">
+                <span>Remaining due</span>
+                <strong
+                  className={preview.due > 0 ? "money-neg" : undefined}
+                >
+                  {formatMoney(preview.due)}
+                </strong>
+              </div>
+
+              <p className="calc-note">
+                Full payment → Paid · some payment → Partially paid · no
+                payment → Unpaid credit sale. The remaining due is tracked
+                automatically.
+              </p>
             </div>
           </div>
         </form>

@@ -4,6 +4,8 @@ import { BarChart, DonutChart, ProgressList } from "../components/Charts";
 import {
   AlertIcon,
   BoxesIcon,
+  CheckCircleIcon,
+  ClockIcon,
   DatabaseIcon,
   PackageIcon,
   RefreshIcon,
@@ -42,8 +44,10 @@ import {
   computeStockValue,
   resolveName,
   resolveStockStatus,
+  roundMoney,
   topEntries,
 } from "../lib/inventory";
+import { buildDailySeries, computeSaleProfit } from "../lib/profit";
 import type { PageId } from "../lib/navigation";
 
 type ProductRow = {
@@ -65,6 +69,15 @@ type SaleRow = {
   paid_amount: number | null;
   due_amount: number | null;
   sale_date: string | null;
+  /** Historical unit cost frozen at sale time (null on legacy rows). */
+  unit_cost: number | null;
+};
+
+type PaymentRow = {
+  id: number;
+  customer_id: number | null;
+  amount: number | null;
+  paid_at: string | null;
 };
 
 type NameRow = {
@@ -73,6 +86,14 @@ type NameRow = {
 };
 
 const CURRENT_YEAR = new Date().getFullYear();
+/** Module-scope snapshot so render-time derivations never call `new Date()`. */
+const DASHBOARD_TODAY = (() => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+
+  return `${now.getFullYear()}-${month}-${day}`;
+})();
 
 export default function Dashboard({
   onNavigate,
@@ -83,15 +104,15 @@ export default function Dashboard({
 
   const [products, setProducts] = useState<ProductRow[]>([]);
   const [sales, setSales] = useState<SaleRow[]>([]);
+  const [payments, setPayments] = useState<PaymentRow[]>([]);
   const [customers, setCustomers] = useState<NameRow[]>([]);
   const [customerCount, setCustomerCount] = useState(0);
   const [supplierCount, setSupplierCount] = useState(0);
-  const [creditOutstanding, setCreditOutstanding] = useState(0);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
-  const [creditWarning, setCreditWarning] = useState("");
+  const [paymentsWarning, setPaymentsWarning] = useState("");
 
   const inFlight = useRef(false);
 
@@ -107,7 +128,7 @@ export default function Dashboard({
       setError("");
 
       try {
-        const [productsResult, salesResult, customersResult, customersHead, suppliersHead, duesResult] =
+        const [productsResult, salesResult, customersResult, customersHead, suppliersHead, paymentsResult] =
           await Promise.all([
             supabase
               .from("products")
@@ -119,7 +140,7 @@ export default function Dashboard({
             supabase
               .from("sales")
               .select(
-                "id, customer_id, product_id, quantity, total_amount, paid_amount, due_amount, sale_date"
+                "id, customer_id, product_id, quantity, total_amount, paid_amount, due_amount, sale_date, unit_cost"
               )
               .order("sale_date", { ascending: false }),
 
@@ -129,7 +150,10 @@ export default function Dashboard({
 
             supabase.from("suppliers").select("*", { count: "exact", head: true }),
 
-            supabase.from("dues").select("remaining_due"),
+            supabase
+              .from("payments")
+              .select("id, customer_id, amount, paid_at")
+              .order("paid_at", { ascending: false }),
           ]);
 
         if (productsResult.error) {
@@ -145,22 +169,18 @@ export default function Dashboard({
         }
 
         /**
-         * FIX: the credit ledger is supplementary. Previously a failure here
-         * threw and blanked the entire dashboard, even though every other
-         * figure was loaded fine. It now degrades to zero and reports why.
+         * FIX: the payments ledger is supplementary. A missing table (the
+         * migration has not run yet) must degrade to an empty feed instead of
+         * blanking the entire dashboard — everything else still loaded fine.
+         * Outstanding dues are derived from sales themselves, so the headline
+         * figure never depends on the payments table.
          */
-        if (duesResult.error) {
-          setCreditWarning(duesResult.error.message);
-          setCreditOutstanding(0);
+        if (paymentsResult.error) {
+          setPaymentsWarning(paymentsResult.error.message);
+          setPayments([]);
         } else {
-          setCreditWarning("");
-          setCreditOutstanding(
-            (duesResult.data ?? []).reduce(
-              (sum: number, row: { remaining_due: number | null }) =>
-                sum + toNumber(row.remaining_due),
-              0
-            )
-          );
+          setPaymentsWarning("");
+          setPayments((paymentsResult.data ?? []) as PaymentRow[]);
         }
 
         if (customersHead.error) setCustomerCount(0);
@@ -250,12 +270,19 @@ export default function Dashboard({
       totalUnits += stock;
     });
 
-    // Cost of goods sold: purchase cost of every unit that has been sold.
-    const costOfGoodsSold = sales.reduce((sum, sale) => {
-      const product = productById.get(Number(sale.product_id));
+    // Cost of goods sold: the historical unit cost frozen on each sale, with
+    // the product's snapshot purchase price as fallback for legacy rows.
+    const costOfGoodsSold = roundMoney(
+      sales.reduce((sum, sale) => {
+        const product = productById.get(Number(sale.product_id));
+        const unitCost =
+          sale.unit_cost !== null
+            ? toNumber(sale.unit_cost)
+            : toNumber(product?.purchase_price);
 
-      return sum + toNumber(sale.quantity) * toNumber(product?.purchase_price);
-    }, 0);
+        return sum + toNumber(sale.quantity) * unitCost;
+      }, 0)
+    );
 
     const lowStock = products.filter(
       (product) =>
@@ -275,6 +302,7 @@ export default function Dashboard({
       retailValue,
       costValue,
       costOfGoodsSold,
+      grossProfit: roundMoney(revenue - costOfGoodsSold),
       totalUnits,
       lowStock,
       outOfStock,
@@ -291,6 +319,102 @@ export default function Dashboard({
         { withinYear: true }
       ),
     [sales]
+  );
+
+  const monthlyProfitSeries = useMemo(
+    () =>
+      buildMonthlySeries(
+        sales.map((sale) => ({
+          // Profit per sale from the historical cost frozen at sale time.
+          amount: computeSaleProfit({
+            quantity: sale.quantity,
+            totalAmount: sale.total_amount,
+            unitCost:
+              sale.unit_cost !== null
+                ? sale.unit_cost
+                : toNumber(productById.get(Number(sale.product_id))?.purchase_price),
+          }).grossProfit,
+          date: sale.sale_date ?? "",
+        })),
+        { withinYear: true }
+      ),
+    [sales, productById]
+  );
+
+  const dailySalesSeries = useMemo(
+    () =>
+      buildDailySeries(
+        sales.map((sale) => ({
+          amount: toNumber(sale.total_amount),
+          date: sale.sale_date ?? "",
+        }))
+      ).map((point) => ({
+        label: point.label,
+        value: point.amount,
+        hint: formatCompactMoney(point.amount),
+      })),
+    [sales]
+  );
+
+  /** Today's and this month's billed sales totals. */
+  const periodSales = useMemo(() => {
+    const todayKey = DASHBOARD_TODAY;
+    const monthPrefix = todayKey.slice(0, 7);
+
+    let todayTotal = 0;
+    let monthTotal = 0;
+
+    sales.forEach((sale) => {
+      const date = String(sale.sale_date ?? "");
+
+      if (date === todayKey) todayTotal += toNumber(sale.total_amount);
+      if (date.startsWith(monthPrefix)) monthTotal += toNumber(sale.total_amount);
+    });
+
+    return { today: roundMoney(todayTotal), month: roundMoney(monthTotal) };
+  }, [sales]);
+
+  /** Products ranked by the gross profit they earned. */
+  const topProfitProducts = useMemo(
+    () =>
+      topEntries(
+        aggregateBy(
+          sales,
+          (sale) =>
+            resolveName(productByIdNames, sale.product_id, "Product"),
+          (sale) =>
+            computeSaleProfit({
+              quantity: sale.quantity,
+              totalAmount: sale.total_amount,
+              unitCost:
+                sale.unit_cost !== null
+                  ? sale.unit_cost
+                  : toNumber(
+                      productById.get(Number(sale.product_id))?.purchase_price
+                    ),
+            }).grossProfit
+        ),
+        6
+      ).map((entry) => ({
+        ...entry,
+        display: formatCompactMoney(entry.value),
+      })),
+    [sales, productByIdNames, productById]
+  );
+
+  const recentPayments = useMemo(
+    () =>
+      payments.slice(0, 6).map((payment) => ({
+        id: Number(payment.id),
+        customer: resolveName(
+          customerByIdNames,
+          payment.customer_id,
+          "Customer"
+        ),
+        amount: toNumber(payment.amount),
+        date: String(payment.paid_at ?? ""),
+      })),
+    [payments, customerByIdNames]
   );
 
 const topProducts = useMemo(
@@ -429,69 +553,96 @@ const topProducts = useMemo(
           </div>
         ) : null}
 
-        {creditWarning ? (
+        {paymentsWarning ? (
           <div className="alert alert-warning" role="status">
             <AlertIcon size={16} />
             <div className="alert-content">
-              <strong>Credit ledger unavailable</strong>
-              The credit figures below could not be loaded ({creditWarning}).
-              Revenue and inventory data are unaffected.
+              <strong>Payments ledger unavailable</strong>
+              The payments feed could not be loaded ({paymentsWarning}). Run the
+              database migration to enable it — all other figures are live.
             </div>
           </div>
         ) : null}
 
         <div className="stat-grid">
           <StatCard
-            label="Revenue"
-            value={formatMoney(metrics.revenue, 0)}
+            label="Total products"
+            value={formatNumber(products.length)}
             tone="lavender"
-            icon={<TrendingUpIcon size={16} />}
+            icon={<PackageIcon size={16} />}
             loading={loading}
-            meta={`${collectionRate.toFixed(0)}% collected`}
+            meta={`${metrics.lowStock.length + metrics.outOfStock.length} need stock attention`}
           />
 
           <StatCard
-            label="Sales"
-            value={formatNumber(sales.length)}
-            tone="pink"
-            icon={<ShoppingCartIcon size={16} />}
+            label="Total available stock"
+            value={formatNumber(metrics.totalUnits)}
+            tone="mint"
+            icon={<BoxesIcon size={16} />}
             loading={loading}
-            meta={`${formatNumber(metrics.unitsSold)} units sold`}
+            meta="Units currently on hand"
           />
 
           <StatCard
-            label="Purchases"
+            label="Inventory purchase value"
             value={formatMoney(metrics.costValue, 0)}
             tone="sky"
             icon={<TruckIcon size={16} />}
             loading={loading}
-            meta={`${formatMoney(metrics.costOfGoodsSold, 0)} cost of goods sold`}
+            meta="What your stock cost (not retail)"
           />
 
           <StatCard
-            label="Inventory value"
-            value={formatMoney(metrics.retailValue, 0)}
-            tone="mint"
-            icon={<BoxesIcon size={16} />}
+            label="Today's sales"
+            value={formatMoney(periodSales.today, 0)}
+            tone="pink"
+            icon={<ClockIcon size={16} />}
             loading={loading}
-            meta={`${formatNumber(metrics.totalUnits)} units on hand`}
+            meta="Billed since midnight"
           />
 
           <StatCard
-            label="Low stock"
-            value={formatNumber(metrics.lowStock.length)}
+            label="Monthly sales"
+            value={formatMoney(periodSales.month, 0)}
+            tone="pink"
+            icon={<TrendingUpIcon size={16} />}
+            loading={loading}
+            meta={`${collectionRate.toFixed(0)}% collected overall`}
+          />
+
+          <StatCard
+            label="Total collected"
+            value={formatMoney(metrics.collected, 0)}
+            tone="mint"
+            icon={<WalletIcon size={16} />}
+            loading={loading}
+            meta={`${formatNumber(sales.length)} sales billed`}
+          />
+
+          <StatCard
+            label="Outstanding dues"
+            value={formatMoney(metrics.outstanding, 0)}
             tone="yellow"
             icon={<AlertIcon size={16} />}
             loading={loading}
-            meta={`${metrics.outOfStock.length} out of stock`}
+            meta="From actual sales records"
+          />
+
+          <StatCard
+            label="Total gross profit"
+            value={formatMoney(metrics.grossProfit, 0)}
+            tone="pink"
+            icon={<CheckCircleIcon size={16} />}
+            loading={loading}
+            meta="Billed − historical cost of goods"
           />
         </div>
 
         <div className="chart-grid">
           <Card>
             <CardHeader
-              title="Revenue & sales trend"
-              description={`Monthly billed revenue across ${CURRENT_YEAR}`}
+              title="Monthly sales trend"
+              description={`Billed revenue per month across ${CURRENT_YEAR}`}
               actions={
                 <Badge tone="lavender">
                   {formatCompactMoney(metrics.revenue)} YTD
@@ -511,6 +662,19 @@ const topProducts = useMemo(
             </CardBody>
           </Card>
 
+          <Card>
+            <CardHeader
+              title="Daily sales — last 14 days"
+              description="Billed amount per calendar day, zero-filled"
+            />
+
+            <CardBody>
+              <BarChart data={dailySalesSeries} height={240} />
+            </CardBody>
+          </Card>
+        </div>
+
+        <div className="chart-grid">
           <Card>
             <CardHeader
               title="Cash collection"
@@ -536,10 +700,33 @@ const topProducts = useMemo(
                 </div>
 
                 <div className="metric-item">
-                  <span>Credit ledger</span>
-                  <strong>{formatMoney(creditOutstanding, 0)}</strong>
+                  <span>Total billed</span>
+                  <strong>{formatMoney(metrics.revenue, 0)}</strong>
                 </div>
               </div>
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader
+              title="Gross profit by month"
+              description={`Billed − historical cost of goods · ${CURRENT_YEAR}`}
+              actions={
+                <Badge tone="mint">
+                  {formatCompactMoney(metrics.grossProfit)} YTD
+                </Badge>
+              }
+            />
+
+            <CardBody>
+              <BarChart
+                data={monthlyProfitSeries.map((point) => ({
+                  label: point.label,
+                  value: point.amount,
+                  hint: formatCompactMoney(point.amount),
+                }))}
+                emptyLabel="No profit recorded for this year yet."
+              />
             </CardBody>
           </Card>
         </div>
@@ -575,6 +762,80 @@ const topProducts = useMemo(
             <CardBody>
               <ProgressList items={topCustomers} />
             </CardBody>
+          </Card>
+        </div>
+
+        <div className="split-grid">
+          <Card>
+            <CardHeader
+              title="Best sellers by gross profit"
+              description="Gross profit each product has earned"
+              actions={
+                <Button size="sm" variant="ghost" onClick={() => onNavigate("profit")}>
+                  Profit report
+                </Button>
+              }
+            />
+
+            <CardBody>
+              <ProgressList items={topProfitProducts} />
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader
+              title="Recent payments"
+              description="Payments received against customer dues"
+              actions={
+                <Button size="sm" variant="ghost" onClick={() => onNavigate("dues")}>
+                  Credit &amp; dues
+                </Button>
+              }
+            />
+
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th className="num">Amount</th>
+                    <th className="num">Date</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {loading ? (
+                    <SkeletonRows rows={5} />
+                  ) : recentPayments.length === 0 ? (
+                    <tr>
+                      <td colSpan={3} className="table-empty-cell">
+                        <EmptyState
+                          icon={<WalletIcon size={20} />}
+                          title="No payments recorded yet"
+                          description={
+                            paymentsWarning
+                              ? "The payments ledger is not available yet — run the database migration to enable it."
+                              : "Record a payment on the Credit & Dues page and it will appear here."
+                          }
+                        />
+                      </td>
+                    </tr>
+                  ) : (
+                    recentPayments.map((payment) => (
+                      <tr key={payment.id}>
+                        <td className="cell-primary">{payment.customer}</td>
+                        <td className="num cell-strong money-pos">
+                          + {formatMoney(payment.amount, 0)}
+                        </td>
+                        <td className="num cell-muted">
+                          {formatDate(payment.date.slice(0, 10))}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
           </Card>
         </div>
 

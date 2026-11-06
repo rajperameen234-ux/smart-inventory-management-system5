@@ -6,6 +6,7 @@ import {
   SettingsIcon,
   ShoppingCartIcon,
   TagIcon,
+  TrendingUpIcon,
   TruckIcon,
   UsersIcon,
   WalletIcon,
@@ -19,6 +20,7 @@ export type PageId =
   | "customers"
   | "sales"
   | "dues"
+  | "profit"
   | "reports"
   | "settings"
   | "reset-password";
@@ -103,6 +105,14 @@ export const NAV_SECTIONS: NavSection[] = [
         accent: "#B45309",
         title: "Credit & Dues",
         subtitle: "Outstanding customer balances",
+      },
+      {
+        id: "profit",
+        label: "Profit",
+        icon: TrendingUpIcon,
+        accent: "#9333EA",
+        title: "Profit",
+        subtitle: "Gross profit from actual sale history",
       },
     ],
   },
