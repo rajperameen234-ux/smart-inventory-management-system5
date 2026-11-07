@@ -573,8 +573,9 @@ export default function Sales() {
 
     /**
      * Preferred path: one database function restores the stock and deletes the
-     * sale in a single transaction, so stock is restored exactly once and any
-     * payments allocated against the sale are removed with it.
+     * sale in a single transaction, so stock is restored exactly once. Payment
+     * rows allocated against the sale are kept as ledger history; only their
+     * sale link is cleared.
      */
     const { error: rpcError } = await supabase.rpc("delete_sale_and_restock", {
       p_sale_id: sale.id,
@@ -1140,7 +1141,7 @@ export default function Sales() {
         open={pendingDelete !== null}
         busy={saving}
         title="Delete sale"
-        description={`The transaction for "${pendingDelete?.customer ?? ""}" worth ${formatMoney(pendingDelete?.totalAmount ?? 0)} will be removed and its units returned to stock.`}
+        description={`The transaction for "${pendingDelete?.customer ?? ""}" worth ${formatMoney(pendingDelete?.totalAmount ?? 0)} will be removed and its units returned to stock. Payments recorded against it remain in the customer's ledger.`}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
           if (pendingDelete) void deleteSale(pendingDelete);
