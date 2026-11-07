@@ -86,9 +86,6 @@ export default function Profit() {
   const toast = useToast();
 
   const [sales, setSales] = useState<ProfitRow[]>([]);
-  const [productMap, setProductMap] = useState<
-    Map<number, { name: string; purchasePrice: number }>
-  >(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -141,8 +138,6 @@ export default function Profit() {
         ])
       );
 
-      setProductMap(mappedProducts);
-
       setSales(
         (salesResult.data ?? []).map((row) => {
           // Sales carry their product snapshot (product_name) frozen at the
@@ -166,7 +161,7 @@ export default function Profit() {
             productId,
             productName:
               row.product_name ??
-              productMap.get(productId)?.name ??
+              mappedProducts.get(productId)?.name ??
               "Product",
             customerId,
             customerName: joined?.[0]?.name
@@ -179,7 +174,7 @@ export default function Profit() {
             unitCost:
               row.unit_cost !== null
                 ? roundMoney(toNumber(row.unit_cost))
-                : productMap.get(productId)?.purchasePrice ?? null,
+                : mappedProducts.get(productId)?.purchasePrice ?? null,
             discount: roundMoney(toNumber(row.discount)),
             totalAmount,
             paidAmount: toNumber(row.paid_amount),

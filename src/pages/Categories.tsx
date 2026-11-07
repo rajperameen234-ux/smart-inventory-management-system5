@@ -257,7 +257,7 @@ export default function Categories() {
     }
 
 setCategories((current) =>
-      current.filter((category) => category.id !== category.id)
+      current.filter((item) => item.id !== category.id)
     );
 
     // Tell the Products dropdown this option is gone.
@@ -352,7 +352,7 @@ setCategories((current) =>
           <CardBody>
             {loading ? (
               <div className="loading-block">
-                Loading categoriesâ€¦
+                Loading categories…
               </div>
             ) : filtered.length === 0 ? (
               <EmptyState

@@ -299,7 +299,7 @@ export function DonutChart({
             <span>
               {slice.label}
               <span style={{ color: "var(--text-muted)" }}>
-                {" Â· "}
+                {" · "}
                 {total > 0
                   ? Math.round((slice.value / total) * 100)
                   : 0}

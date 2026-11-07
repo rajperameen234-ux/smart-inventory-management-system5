@@ -12,18 +12,17 @@ import {
   WalletIcon,
 } from "../components/Icon";
 
-export type PageId =
-  | "dashboard"
-  | "products"
-  | "categories"
-  | "suppliers"
-  | "customers"
-  | "sales"
-  | "dues"
-  | "profit"
-  | "reports"
-  | "settings"
-  | "reset-password";
+// The page ids and hash parsing live in the pure `pages` module so node
+// --test can exercise them without pulling in React components.
+export {
+  DEFAULT_PAGE,
+  isPageId,
+  parsePageFromHash,
+  PAGES,
+} from "./pages";
+export type { PageId } from "./pages";
+
+import type { PageId } from "./pages";
 
 export type NavIcon = ComponentType<{ size?: number }>;
 
@@ -142,12 +141,6 @@ export const NAV_SECTIONS: NavSection[] = [
 export const ALL_NAV_ITEMS: NavEntry[] = NAV_SECTIONS.flatMap(
   (section) => section.items
 );
-
-export const DEFAULT_PAGE: PageId = "dashboard";
-
-export function isPageId(value: string): value is PageId {
-  return ALL_NAV_ITEMS.some((item) => item.id === value);
-}
 
 export function getNavEntry(id: PageId): NavEntry {
   return (

@@ -21,14 +21,20 @@ export default function ResetPassword() {
         throw new Error("Passwords do not match.");
       }
 
-      (supabase.auth as any).updatePassword(password);
+      // Recovery links sign the user in automatically, so the new password is
+      // applied to the live session and the user lands directly in the app.
+      const { error: updateError } = await supabase.auth.updateUser({
+        password,
+      });
+
+      if (updateError) throw updateError;
 
       setMessage(
-        "Password updated successfully! You can now log in with your new password."
+        "Password updated successfully! Taking you to your workspace..."
       );
 
       setTimeout(() => {
-        window.location.hash = "#/auth";
+        window.location.hash = "#/dashboard";
       }, 2000);
     } catch (caught) {
       setError(

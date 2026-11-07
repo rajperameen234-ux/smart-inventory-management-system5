@@ -1002,7 +1002,7 @@ export default function Customers({
         open={pendingDelete !== null}
         busy={saving}
         title="Delete customer"
-        description={`"${pendingDelete?.name ?? ""}" and all of their linked records will be permanently removed.`}
+        description={`"${pendingDelete?.name ?? ""}" will be permanently removed. Customers with recorded sales cannot be deleted.`}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
           if (pendingDelete) void deleteCustomer(pendingDelete);

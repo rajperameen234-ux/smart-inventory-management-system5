@@ -28,13 +28,10 @@ const HIGHLIGHTS = [
 export default function Auth() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [mode, setMode] = useState<"login" | "signup" | "forgot" | "reset">(
-    "login"
-  );
+  const [mode, setMode] = useState<"login" | "signup" | "forgot">("login");
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -60,34 +57,30 @@ export default function Auth() {
 
         if (signUpError) throw signUpError;
 
-        if (data.user) {
-          (supabase.auth as any).signInWithPassword({ email, password });
-        }
-
-        setMessage("Account created successfully! You are now logged in.");
+        // signUp already returns a session when email confirmation is
+        // disabled; when confirmation is required the session is null and
+        // the user must activate the mailbox link first.
+        setMessage(
+          data.session
+            ? "Account created successfully! You are now logged in."
+            : "Account created. Check your email inbox and confirm your address before signing in."
+        );
       } else if (mode === "forgot") {
-        (supabase.auth as any).signInWithOtp({
+        const { error: otpError } = await supabase.auth.signInWithOtp({
           email,
-          redirectTo: window.location.origin + "/#/reset-password",
+          options: {
+            // Supabase appends the access/refresh tokens as a second "#"
+            // fragment; App parses the router page before Supabase clears
+            // the hash, so this link opens the reset page directly.
+            emailRedirectTo: window.location.origin + "/#/reset-password",
+          },
         });
+
+        if (otpError) throw otpError;
 
         setMessage(
           "Check your email for password reset instructions. After clicking the link, you'll be taken to the reset password page."
         );
-      } else if (mode === "reset") {
-        if (password !== confirmPassword) {
-          throw new Error("Passwords do not match.");
-        }
-
-        (supabase.auth as any).updatePassword(password);
-
-        setMessage(
-          "Password updated successfully! You can now log in with your new password."
-        );
-        setMode("login");
-        setEmail("");
-        setPassword("");
-        setConfirmPassword("");
       }
     } catch (caught) {
       setError(
@@ -200,38 +193,6 @@ export default function Auth() {
               </span>
             </div>
 
-            {mode === "reset" && (
-              <div className="field">
-                <span className="label">Confirm Password</span>
-
-                <span style={{ position: "relative", display: "block" }}>
-                  <span
-                    style={{
-                      position: "absolute",
-                      left: 11,
-                      top: "50%",
-                      transform: "translateY(-50%)",
-                      color: "var(--text-muted)",
-                      pointerEvents: "none",
-                    }}
-                  >
-                    <LockIcon size={15} />
-                  </span>
-
-                  <input
-                    type="password"
-                    className="input"
-                    value={confirmPassword}
-                    onChange={(event) => setConfirmPassword(event.target.value)}
-                    placeholder="Confirm your password"
-                    required
-                    autoComplete="new-password"
-                    style={{ paddingLeft: 34 }}
-                  />
-                </span>
-              </div>
-            )}
-
             <div className="field">
               <span className="label">Password</span>
 
@@ -254,10 +215,10 @@ export default function Auth() {
                   className="input"
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
-                  placeholder={mode === "reset" ? "Enter new password" : "At least 6 characters"}
+                  placeholder="At least 6 characters"
                   minLength={6}
                   required
-                  autoComplete={mode === "reset" ? "new-password" : "new-password"}
+                  autoComplete="new-password"
                   style={{ paddingLeft: 34 }}
                 />
               </span>
@@ -296,7 +257,6 @@ export default function Auth() {
                     setMode("signup");
                     setEmail("");
                     setPassword("");
-                    setConfirmPassword("");
                   }}
                 >
                   Create account
@@ -312,7 +272,6 @@ export default function Auth() {
                     setMode("login");
                     setEmail("");
                     setPassword("");
-                    setConfirmPassword("");
                   }}
                 >
                   Back to sign in
@@ -328,38 +287,23 @@ export default function Auth() {
                     setMode("login");
                     setEmail("");
                     setPassword("");
-                    setConfirmPassword("");
                   }}
                 >
                   Back to sign in
                 </button>
               </>
             )}
-            {mode === "reset" && (
-              <>
-                {"Back to login? "}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode("login");
-                    setEmail("");
-                    setPassword("");
-                    setConfirmPassword("");
-                  }}
-                >
-                  Back to sign in
-                </button>
-              </>
+            {mode !== "forgot" && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMode("forgot");
+                  setEmail("");
+                }}
+              >
+                Forgot Password?
+              </button>
             )}
-            <button
-              type="button"
-              onClick={() => {
-                setMode("forgot");
-                setEmail("");
-              }}
-            >
-              Forgot Password?
-            </button>
           </div>
         </div>
       </main>
@@ -367,30 +311,24 @@ export default function Auth() {
   );
 }
 
-function getModeTitle(mode: "login" | "signup" | "forgot" | "reset"): string {
-  if (mode === "login" || mode === "forgot") return "Welcome back";
+function getModeTitle(mode: "login" | "signup" | "forgot"): string {
   if (mode === "signup") return "Create your account";
-  if (mode === "reset") return "Reset Password";
+  if (mode === "forgot") return "Reset your password";
   return "Welcome back";
 }
 
-function getModeDescription(mode: "login" | "signup" | "forgot" | "reset"): string {
-  if (mode === "login") {
-    return "Sign in to continue to your inventory workspace.";
-  }
+function getModeDescription(mode: "login" | "signup" | "forgot"): string {
   if (mode === "signup") {
     return "Get started with your own secure workspace in seconds.";
   }
   if (mode === "forgot") {
     return "Enter your registered email address to begin the password reset process.";
   }
-  return "Enter a new password to reset your account password.";
+  return "Sign in to continue to your inventory workspace.";
 }
 
-function getButtonLabel(mode: "login" | "signup" | "forgot" | "reset"): string {
-  if (mode === "login") return "Sign in to workspace";
+function getButtonLabel(mode: "login" | "signup" | "forgot"): string {
   if (mode === "signup") return "Create account";
   if (mode === "forgot") return "Send reset link";
-  if (mode === "reset") return "Update password";
-  return "Create account";
+  return "Sign in to workspace";
 }

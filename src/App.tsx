@@ -5,8 +5,8 @@ import AppShell from "./components/AppShell";
 import { useToast } from "./components/Toast";
 import {
   DEFAULT_PAGE,
-  isPageId,
   type PageId,
+  parsePageFromHash,
 } from "./lib/navigation";
 
 import Dashboard from "./pages/Dashboard";
@@ -21,17 +21,21 @@ import Reports from "./pages/Reports";
 import Settings from "./pages/Settings";
 import ResetPassword from "./pages/ResetPassword";
 
-function readPageFromHash(): PageId {
-  if (typeof window === "undefined") return DEFAULT_PAGE;
-
-  const hash = window.location.hash.replace(/^#\/?/, "").trim();
-
-  if (isPageId(hash)) return hash;
-
-  if (hash === "reset-password") return "reset-password" as PageId;
-
-  return DEFAULT_PAGE;
-}
+/**
+ * Captured at module evaluation time — before Supabase's async session
+ * recovery runs. A recovery callback URL looks like
+ *
+ *   /#/reset-password#access_token=...&refresh_token=...
+ *
+ * and the auth client clears the ENTIRE location hash once it has consumed
+ * the tokens. Reading the page from the URL here guarantees the user still
+ * lands on the reset form when the app mounts, instead of being dropped on
+ * the dashboard.
+ */
+const INITIAL_PAGE: PageId =
+  typeof window === "undefined"
+    ? DEFAULT_PAGE
+    : parsePageFromHash(window.location.hash);
 
 function useCurrentUserEmail(): string {
   const [email, setEmail] = useState("");
@@ -61,13 +65,13 @@ function useCurrentUserEmail(): string {
 export default function App() {
   const toast = useToast();
 
-  const [currentPage, setCurrentPage] = useState<PageId>(readPageFromHash);
+  const [currentPage, setCurrentPage] = useState<PageId>(INITIAL_PAGE);
   const [searchSeed, setSearchSeed] = useState("");
   const userEmail = useCurrentUserEmail();
 
   useEffect(() => {
     function onHashChange() {
-      setCurrentPage(readPageFromHash());
+      setCurrentPage(parsePageFromHash(window.location.hash));
     }
 
     window.addEventListener("hashchange", onHashChange);

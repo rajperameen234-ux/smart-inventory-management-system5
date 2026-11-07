@@ -368,7 +368,7 @@ export default function Suppliers({
 
                       <td>
                         <span className="cell-stack">
-                          <span>{supplier.phone || "â€”"}</span>
+                          <span>{supplier.phone || "—"}</span>
                         </span>
                       </td>
 
@@ -381,7 +381,7 @@ export default function Suppliers({
                             {supplier.email}
                           </a>
                         ) : (
-                          <span className="cell-muted">â€”</span>
+                          <span className="cell-muted">—</span>
                         )}
                       </td>
 
@@ -390,7 +390,7 @@ export default function Suppliers({
                           className="truncate"
                           style={{ display: "inline-block" }}
                         >
-                          {supplier.address || "â€”"}
+                          {supplier.address || "—"}
                         </span>
                       </td>
 
