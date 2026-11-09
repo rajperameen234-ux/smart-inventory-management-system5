@@ -92,7 +92,13 @@ export function CardBody({
 /*  Buttons                                                                    */
 /* -------------------------------------------------------------------------- */
 
-type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "soft-danger";
+type ButtonVariant =
+  | "primary"
+  | "secondary"
+  | "ghost"
+  | "danger"
+  | "soft-danger"
+  | "whatsapp";
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: ButtonVariant;

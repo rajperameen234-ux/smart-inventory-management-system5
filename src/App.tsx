@@ -19,19 +19,7 @@ import CreditDues from "./pages/CreditDues";
 import Profit from "./pages/Profit";
 import Reports from "./pages/Reports";
 import Settings from "./pages/Settings";
-import ResetPassword from "./pages/ResetPassword";
 
-/**
- * Captured at module evaluation time — before Supabase's async session
- * recovery runs. A recovery callback URL looks like
- *
- *   /#/reset-password#access_token=...&refresh_token=...
- *
- * and the auth client clears the ENTIRE location hash once it has consumed
- * the tokens. Reading the page from the URL here guarantees the user still
- * lands on the reset form when the app mounts, instead of being dropped on
- * the dashboard.
- */
 const INITIAL_PAGE: PageId =
   typeof window === "undefined"
     ? DEFAULT_PAGE
@@ -134,7 +122,6 @@ export default function App() {
       {currentPage === "reports" ? <Reports /> : null}
 
       {currentPage === "settings" ? <Settings /> : null}
-      {currentPage === "reset-password" ? <ResetPassword /> : null}
     </AppShell>
   );
 }

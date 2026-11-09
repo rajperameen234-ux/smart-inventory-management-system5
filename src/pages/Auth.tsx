@@ -31,7 +31,7 @@ export default function Auth() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [mode, setMode] = useState<"login" | "signup" | "forgot">("login");
+  const [mode, setMode] = useState<"login" | "signup">("login");
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -65,22 +65,6 @@ export default function Auth() {
             ? "Account created successfully! You are now logged in."
             : "Account created. Check your email inbox and confirm your address before signing in."
         );
-      } else if (mode === "forgot") {
-        const { error: otpError } = await supabase.auth.signInWithOtp({
-          email,
-          options: {
-            // Supabase appends the access/refresh tokens as a second "#"
-            // fragment; App parses the router page before Supabase clears
-            // the hash, so this link opens the reset page directly.
-            emailRedirectTo: window.location.origin + "/#/reset-password",
-          },
-        });
-
-        if (otpError) throw otpError;
-
-        setMessage(
-          "Check your email for password reset instructions. After clicking the link, you'll be taken to the reset password page."
-        );
       }
     } catch (caught) {
       setError(
@@ -89,6 +73,10 @@ export default function Auth() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function gotoForgotPassword() {
+    window.location.hash = "#/forgot-password";
   }
 
   return (
@@ -247,38 +235,30 @@ export default function Auth() {
             </button>
           </form>
 
-<div className="auth-footer">
-            {mode === "login" && (
-              <>
-                {"Don't have an account? "}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode("signup");
-                    setEmail("");
-                    setPassword("");
-                  }}
-                >
-                  Create account
-                </button>
-              </>
-            )}
-            {mode === "signup" && (
-              <>
-                {"Back to sign in? "}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMode("login");
-                    setEmail("");
-                    setPassword("");
-                  }}
-                >
-                  Back to sign in
-                </button>
-              </>
-            )}
-            {mode === "forgot" && (
+          <div className="auth-footer">
+            {mode === "login" ? (
+              <div className="auth-links">
+                <span className="auth-link-note">
+                  {"Don't have an account? "}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode("signup");
+                      setEmail("");
+                      setPassword("");
+                    }}
+                  >
+                    Create account
+                  </button>
+                </span>
+
+                <span>
+                  <button type="button" onClick={gotoForgotPassword}>
+                    Forgot Password?
+                  </button>
+                </span>
+              </div>
+            ) : (
               <>
                 {"Back to sign in? "}
                 <button
@@ -292,17 +272,6 @@ export default function Auth() {
                   Back to sign in
                 </button>
               </>
-            )}
-            {mode !== "forgot" && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMode("forgot");
-                  setEmail("");
-                }}
-              >
-                Forgot Password?
-              </button>
             )}
           </div>
         </div>
@@ -311,24 +280,19 @@ export default function Auth() {
   );
 }
 
-function getModeTitle(mode: "login" | "signup" | "forgot"): string {
+function getModeTitle(mode: "login" | "signup"): string {
   if (mode === "signup") return "Create your account";
-  if (mode === "forgot") return "Reset your password";
   return "Welcome back";
 }
 
-function getModeDescription(mode: "login" | "signup" | "forgot"): string {
+function getModeDescription(mode: "login" | "signup"): string {
   if (mode === "signup") {
     return "Get started with your own secure workspace in seconds.";
-  }
-  if (mode === "forgot") {
-    return "Enter your registered email address to begin the password reset process.";
   }
   return "Sign in to continue to your inventory workspace.";
 }
 
-function getButtonLabel(mode: "login" | "signup" | "forgot"): string {
+function getButtonLabel(mode: "login" | "signup"): string {
   if (mode === "signup") return "Create account";
-  if (mode === "forgot") return "Send reset link";
   return "Sign in to workspace";
 }

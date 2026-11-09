@@ -13,6 +13,7 @@ import {
   SearchIcon,
   TrashIcon,
   WalletIcon,
+  WhatsAppIcon,
 } from "../components/Icon";
 import {
   Badge,
@@ -23,6 +24,7 @@ import {
   EmptyState,
   Field,
   Input,
+  LoadingBlock,
   Modal,
   PageHeader,
   PageStack,
@@ -30,6 +32,7 @@ import {
   Select,
   SkeletonRows,
   StatCard,
+  Textarea,
   type BadgeTone,
 } from "../components/ui";
 import { formatDate, formatMoney, formatNumber, toDateInputValue, todayISODate } from "../lib/format";
@@ -41,6 +44,13 @@ import {
   validateDue,
 } from "../lib/inventory";
 import { allocatePayment, computePaymentStatus, type PaymentStatus } from "../lib/profit";
+import {
+  buildReminderMessage,
+  buildWhatsAppUrl,
+  getBusinessName,
+  normalizePakistaniPhone,
+  prettyPakistaniPhone,
+} from "../lib/whatsapp";
 
 type CustomerRef = {
   id: number;
@@ -88,6 +98,36 @@ const STATUS_TONE: Record<PaymentStatus, BadgeTone> = {
 type DetailTarget = { customer: CustomerDue } | null;
 type PayTarget = CustomerDue | null;
 
+/**
+ * One WhatsApp dues reminder while it is being prepared: the modal fetches
+ * the customer's latest sales from Supabase before every send and rebuilds
+ * the message from those figures.
+ */
+type ReminderTarget = {
+  id: number;
+  /** Row snapshot — shown until the fresh figures land. */
+  name: string;
+  loading: boolean;
+  fetchError: string;
+  totalPurchases: number;
+  totalPaid: number;
+  outstandingDue: number;
+  /** Phone exactly as saved (may be malformed) — shown in validation message. */
+  savedPhone: string;
+  /** wa.me digits without the "+" (e.g. "923001234567"), or null. */
+  waDigits: string | null;
+  waNumber: string;
+  message: string;
+  messageDirty: boolean;
+  phoneMissing: boolean;
+};
+
+type ReminderTotals = {
+  totalPurchases: number;
+  totalPaid: number;
+  outstandingDue: number;
+};
+
 export default function CreditDues() {
   const toast = useToast();
 
@@ -104,6 +144,7 @@ export default function CreditDues() {
 
   const [detailTarget, setDetailTarget] = useState<DetailTarget>(null);
   const [payTarget, setPayTarget] = useState<PayTarget>(null);
+  const [reminder, setReminder] = useState<ReminderTarget | null>(null);
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -620,6 +661,176 @@ export default function CreditDues() {
     toast.success("Due deleted successfully");
   };
 
+  /* ------------------------- whatsapp dues reminder ------------------------- */
+
+  const closeReminder = () => {
+    setReminder(null);
+  };
+
+  /** Balance aggregation identical to `loadAllData` — same trusted math. */
+  const aggregateSales = (rows: { total_amount: unknown; paid_amount: unknown }[]): ReminderTotals => {
+    let totalPurchases = 0;
+    let totalPaid = 0;
+
+    rows.forEach((row) => {
+      totalPurchases = roundMoney(totalPurchases + toNumber(row.total_amount));
+      totalPaid = roundMoney(totalPaid + toNumber(row.paid_amount));
+    });
+
+    return {
+      totalPurchases,
+      totalPaid,
+      outstandingDue: Math.max(0, roundMoney(totalPurchases - totalPaid)),
+    };
+  };
+
+  /**
+   * Open the reminder modal. The latest customer row and the customer's open
+   * sales are re-read from Supabase at that moment so every figure in the
+   * message is current — read-only, no dues or payments are modified and RLS
+   * scopes every query to the signed-in shop.
+   */
+  const openReminder = async (customer: CustomerDue) => {
+    const businessName = getBusinessName();
+
+    const seedMessage = buildReminderMessage({
+      customerName: customer.name,
+      businessName,
+      totalPurchases: customer.totalPurchases,
+      totalPaid: customer.totalPaid,
+      outstandingDue: customer.outstandingDue,
+    });
+
+    const digits = normalizePakistaniPhone(customer.phone);
+
+    setReminder({
+      id: customer.id,
+      name: customer.name,
+      loading: true,
+      fetchError: "",
+      totalPurchases: customer.totalPurchases,
+      totalPaid: customer.totalPaid,
+      outstandingDue: customer.outstandingDue,
+      savedPhone: customer.phone,
+      waDigits: digits,
+      waNumber: digits ? prettyPakistaniPhone(digits) : "",
+      message: seedMessage,
+      messageDirty: false,
+      phoneMissing: customer.phone.trim().length === 0,
+    });
+
+    const [customerResult, salesResult] = await Promise.all([
+      supabase
+        .from("customers")
+        .select("id, name, phone")
+        .eq("id", customer.id)
+        .limit(1)
+        .maybeSingle(),
+
+      supabase
+        .from("sales")
+        .select("total_amount, paid_amount")
+        .eq("customer_id", customer.id),
+    ]);
+
+    if (customerResult.error) {
+      console.error("Reminder Customer Error:", customerResult.error);
+      toast.error(
+        "Could not load customer details",
+        customerResult.error.message
+      );
+      setReminder(null);
+      return;
+    }
+
+    if (salesResult.error) {
+      console.error("Reminder Sales Error:", salesResult.error);
+      toast.error("Could not load payment details", salesResult.error.message);
+      setReminder(null);
+      return;
+    }
+
+    const latestName = String(customerResult.data?.name ?? customer.name);
+    const latestPhone = String(customerResult.data?.phone ?? customer.phone);
+    const latestDigits = normalizePakistaniPhone(latestPhone);
+    const latestTotals = aggregateSales(salesResult.data ?? []);
+    const latestMessage = buildReminderMessage({
+      customerName: latestName,
+      businessName,
+      ...latestTotals,
+    });
+
+    setReminder((current) => {
+      if (!current || current.id !== customer.id) return current;
+
+      return {
+        ...current,
+        name: latestName,
+        loading: false,
+        totalPurchases: latestTotals.totalPurchases,
+        totalPaid: latestTotals.totalPaid,
+        outstandingDue: latestTotals.outstandingDue,
+        savedPhone: latestPhone,
+        waDigits: latestDigits,
+        waNumber: latestDigits ? prettyPakistaniPhone(latestDigits) : "",
+        // The default message refreshes with the fresh figures unless the
+        // user has already started editing — an edit is always preserved.
+        message:
+          current.messageDirty || latestDigits !== digits
+            ? current.message
+            : latestMessage,
+        phoneMissing: latestPhone.trim().length === 0,
+      };
+    });
+  };
+
+  const editReminderMessage = (next: string) => {
+    setReminder((current) =>
+      current ? { ...current, message: next, messageDirty: true } : current
+    );
+  };
+
+  const restoreReminderMessage = () => {
+    setReminder((current) =>
+      current
+        ? {
+            ...current,
+            messageDirty: false,
+            message: buildReminderMessage({
+              customerName: current.name,
+              businessName: getBusinessName(),
+              totalPurchases: current.totalPurchases,
+              totalPaid: current.totalPaid,
+              outstandingDue: current.outstandingDue,
+            }),
+          }
+        : current
+    );
+  };
+
+  const openWhatsAppChat = () => {
+    const target = reminder;
+
+    if (!target || !target.waDigits || target.loading) return;
+
+    const url = buildWhatsAppUrl(target.waDigits, target.message);
+
+    // User-initiated action only: the message is NEVER sent here. The
+    // shopkeeper presses Send inside WhatsApp.
+    const opened = window.open(url, "_blank", "noopener,noreferrer");
+
+    if (!opened) {
+      window.location.href = url;
+    }
+
+    toast.info(
+      "WhatsApp opened",
+      "The chat is pre-filled with your reminder — review and press Send there."
+    );
+
+    closeReminder();
+  };
+
   /* ------------------------------- derived ------------------------------- */
 
   const filteredCustomers = useMemo(() => {
@@ -880,6 +1091,17 @@ export default function CreditDues() {
                             <EyeIcon size={14} />
                             Details
                           </Button>
+
+                          {customer.outstandingDue > 0 ? (
+                            <Button
+                              size="sm"
+                              variant="whatsapp"
+                              onClick={() => void openReminder(customer)}
+                            >
+                              <WhatsAppIcon size={14} />
+                              Remind via WhatsApp
+                            </Button>
+                          ) : null}
                         </span>
                       </td>
                     </tr>
@@ -1177,6 +1399,139 @@ export default function CreditDues() {
                 {detailPayments.length === 1 ? "" : "s"} recorded
               </p>
             ) : null}
+          </div>
+        ) : null}
+      </Modal>
+
+      {/* ------------------------ whatsapp reminder ------------------------ */}
+
+      <Modal
+        open={reminder !== null}
+        size="md"
+        title="WhatsApp dues reminder"
+        description="Nothing is sent automatically — you review the message and press Send in WhatsApp."
+        onClose={closeReminder}
+        footer={
+          <>
+            <Button variant="ghost" onClick={closeReminder}>
+              Cancel
+            </Button>
+
+            <Button
+              variant="whatsapp"
+              onClick={openWhatsAppChat}
+              disabled={
+                reminder?.loading ||
+                Boolean(reminder?.fetchError) ||
+                !reminder?.waDigits ||
+                reminder?.outstandingDue <= 0
+              }
+            >
+              <WhatsAppIcon size={15} />
+              Open WhatsApp
+            </Button>
+          </>
+        }
+      >
+        {reminder ? (
+          <div className="modal-body">
+            {reminder.loading ? (
+              <LoadingBlock label="Fetching the latest payment details..." />
+            ) : reminder.fetchError ? (
+              <div className="alert alert-error" role="alert">
+                <AlertIcon size={16} />
+                <div className="alert-content">
+                  <strong>Could not load payment details</strong>
+                  {reminder.fetchError}
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="calc-panel">
+                  <div className="calc-row">
+                    <span>Customer</span>
+                    <strong>{reminder.name}</strong>
+                  </div>
+
+                  <div className="calc-row">
+                    <span>WhatsApp number</span>
+                    <strong>
+                      {reminder.waDigits ? reminder.waNumber : "Not available"}
+                    </strong>
+                  </div>
+
+                  <div className="calc-row">
+                    <span>Total amount</span>
+                    <strong>{formatMoney(reminder.totalPurchases)}</strong>
+                  </div>
+
+                  <div className="calc-row">
+                    <span>Paid amount</span>
+                    <strong className="money-pos">
+                      {formatMoney(reminder.totalPaid)}
+                    </strong>
+                  </div>
+
+                  <div className="calc-row">
+                    <span>Remaining dues</span>
+                    <strong
+                      className={
+                        reminder.outstandingDue > 0 ? "money-neg" : "money-pos"
+                      }
+                    >
+                      {formatMoney(reminder.outstandingDue)}
+                    </strong>
+                  </div>
+                </div>
+
+                {reminder.outstandingDue <= 0 ? (
+                  <div className="alert alert-warning" role="status">
+                    <AlertIcon size={16} />
+                    <div className="alert-content">
+                      <strong>Balance fully settled</strong>
+                      {reminder.name} has paid everything — no reminder is
+                      needed. Refresh the page to see the updated balance.
+                    </div>
+                  </div>
+                ) : null}
+
+                {!reminder.waDigits ? (
+                  <div className="alert alert-error" role="alert">
+                    <AlertIcon size={16} />
+                    <div className="alert-content">
+                      <strong>A valid WhatsApp number is required</strong>
+                      {reminder.phoneMissing
+                        ? `${reminder.name} has no phone number saved. Add a phone number on the Customers page first.`
+                        : `The saved number "${reminder.savedPhone}" is not a valid Pakistani mobile number. Correct it on the Customers page to enable WhatsApp reminders.`}
+                    </div>
+                  </div>
+                ) : null}
+
+                <Field
+                  label="Message preview"
+                  hint="Edit the text below — your changes are kept when WhatsApp opens."
+                >
+                  <Textarea
+                    rows={13}
+                    value={reminder.message}
+                    onChange={(event) => editReminderMessage(event.target.value)}
+                    spellCheck={false}
+                  />
+                </Field>
+
+                <div className="reminder-actions">
+                  <Button size="sm" variant="ghost" onClick={restoreReminderMessage}>
+                    <RefreshIcon size={13} />
+                    Restore default message
+                  </Button>
+
+                  <span className="reminder-note">
+                    Uses official WhatsApp Click-to-Chat — WhatsApp itself sends
+                    nothing until you press Send.
+                  </span>
+                </div>
+              </>
+            )}
           </div>
         ) : null}
       </Modal>

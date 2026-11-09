@@ -862,6 +862,18 @@
   background: #fee2e2;
 }
 
+/* WhatsApp brand green for the dues-reminder actions (also in modals). */
+.btn-whatsapp {
+  background: #25d366;
+  border-color: #25d366;
+  color: #05401d;
+}
+
+.btn-whatsapp:hover:not(:disabled) {
+  background: #1fbe5a;
+  border-color: #1fbe5a;
+}
+
 .btn-sm {
   height: 30px;
   padding: 0 10px;
@@ -2225,6 +2237,53 @@ input[type="number"].input {
   text-decoration: underline;
 }
 
+/* Two inline auth actions (Create account / Forgot Password) that must stay
+   clearly separated and wrap instead of overlapping on narrow screens. */
+.auth-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: center;
+  gap: 6px 18px;
+}
+
+/* Trailing action inside a field (Show / Hide password). */
+.input-trailing {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 0;
+  background: transparent;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.input-trailing:hover {
+  color: var(--brand-700);
+  background: var(--brand-50);
+}
+
+.input-with-action {
+  padding-right: 74px;
+}
+
+.reset-message {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 26px 0 10px;
+}
+
+.reset-message p {
+  font-size: 13.5px;
+  color: var(--text-muted);
+}
+
 /* --------------------------------------------------------------------------
    Boot / session loading screen
    -------------------------------------------------------------------------- */
@@ -2514,6 +2573,22 @@ input[type="number"].input {
   font-size: 12px;
   line-height: 1.55;
   color: var(--text-muted);
+}
+
+/* WhatsApp reminder modal footer row (restore button + note). */
+.reminder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+}
+
+.reminder-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  max-width: 34ch;
 }
 
 /* Clickable product name / row link styled as text */
