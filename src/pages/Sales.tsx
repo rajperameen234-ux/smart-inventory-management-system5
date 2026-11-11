@@ -31,8 +31,9 @@ import {
   SkeletonRows,
   StatCard,
 } from "../components/ui";
-import { formatMoney, formatNumber, todayISODate } from "../lib/format";
+import { formatMoney, formatMoneyRaw, formatNumber, todayISODate } from "../lib/format";
 import { formatDate, toDateInputValue } from "../lib/date";
+import { useCurrency } from "../components/CurrencyProvider";
 import {
   computeLineTotals,
   computeSaleAmounts,
@@ -86,6 +87,13 @@ type Product = {
 
 export default function Sales() {
   const toast = useToast();
+
+  /**
+   * Money inputs are typed in the SELECTED display currency and converted to
+   * the base currency (PKR) exactly once when saving; edit forms are seeded
+   * from the stored base amounts exactly once when opening.
+   */
+  const { currency, toPkr, toDisplay } = useCurrency();
 
   const [sales, setSales] = useState<Sale[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -284,16 +292,17 @@ export default function Sales() {
     // Historical prices recorded with the sale. A legacy sale (recorded
     // before the migration) has no stored unit price, so the effective unit
     // price derived from its own total is pre-filled instead — the sale's
-    // actual figures are not silently reinterpreted.
+    // actual figures are not silently reinterpreted. Stored base amounts are
+    // shown in the selected display currency with precision preserved.
     setUnitPrice(
       sale.unitPrice !== null
-        ? String(sale.unitPrice)
+        ? String(toDisplay(sale.unitPrice))
         : sale.quantity > 0
-          ? String(roundMoney(sale.totalAmount / sale.quantity))
+          ? String(toDisplay(roundMoney(sale.totalAmount / sale.quantity)))
           : ""
     );
-    setDiscount(sale.discount ? String(sale.discount) : "");
-    setPaidAmount(String(sale.paidAmount));
+    setDiscount(sale.discount ? String(toDisplay(sale.discount)) : "");
+    setPaidAmount(String(toDisplay(sale.paidAmount)));
 
     // FIX: normalise the stored value for <input type="date">. A raw
     // timestamp such as 2026-01-01T00:00:00+00:00 renders as an empty field.
@@ -350,12 +359,18 @@ export default function Sales() {
     if (saving || !savingRef.begin()) return;
 
     // Money comes from the actual form inputs — selling price per unit,
-    // quantity, discount and payment.
+    // quantity, discount and payment. The inputs are typed in the selected
+    // display currency and are converted to the stored base currency (PKR)
+    // exactly once; everything from here on works in base units.
+    const unitPriceBase = toPkr(Number(unitPrice));
+    const discountBase = toPkr(Number(discount));
+    const paidBase = toPkr(Number(paidAmount));
+
     const amounts = computeSaleAmounts({
-      unitPrice,
+      unitPrice: unitPriceBase,
       quantity,
-      discount: discount === "" ? 0 : discount,
-      paid: paidAmount === "" ? 0 : paidAmount,
+      discount: discountBase,
+      paid: paidBase,
     });
 
     const issues = validateSale({
@@ -363,11 +378,11 @@ export default function Sales() {
       productId,
       quantity,
       totalAmount: String(amounts.final),
-      paidAmount,
+      paidAmount: String(paidBase),
       date,
       availableStock: availableForForm,
-      unitPrice,
-      discount,
+      unitPrice: String(unitPriceBase),
+      discount: String(discountBase),
     });
 
     if (issues.length > 0) {
@@ -418,7 +433,7 @@ export default function Sales() {
           ? roundMoney(previous.totalAmount - paid)
           : due,
       sale_date: date,
-      unit_price: Number(unitPrice),
+      unit_price: unitPriceBase,
       unit_cost: productSnapshot
         ? productSnapshot.purchasePrice
         : (previous?.unitCost ?? 0),
@@ -998,7 +1013,9 @@ export default function Sales() {
                     );
 
                     if (product) {
-                      setUnitPrice(String(product.sellingPrice));
+                      // Stored base price shown in the selected display
+                      // currency, with precision preserved for round-tripping.
+                      setUnitPrice(String(toDisplay(product.sellingPrice)));
                     }
                   }}
                 >
@@ -1024,10 +1041,11 @@ export default function Sales() {
               </Field>
 
               <Field
-                label="Selling price per unit (Rs.)"
+                label={`Selling price per unit (${currency})`}
                 required
                 hint={
-                  selectedProduct && Number(unitPrice) === selectedProduct.sellingPrice
+                  selectedProduct &&
+                  toDisplay(selectedProduct.sellingPrice) === Number(unitPrice)
                     ? "Loaded from the product's selling price."
                     : "Pre-filled from the product — adjust only if you negotiated a different price."
                 }
@@ -1042,7 +1060,7 @@ export default function Sales() {
                 />
               </Field>
 
-              <Field label="Discount (Rs.)">
+              <Field label={`Discount (${currency})`}>
                 <Input
                   type="number"
                   min="0"
@@ -1078,10 +1096,10 @@ export default function Sales() {
               </Field>
 
               <Field
-                label="Payment received (Rs.)"
+                label={`Payment received (${currency})`}
                 hint={
                   preview.due > 0
-                    ? `Balance after payment: ${formatMoney(preview.due)}`
+                    ? `Balance after payment: ${formatMoneyRaw(preview.due)}`
                     : "Fully paid — no balance remains."
                 }
               >
@@ -1099,22 +1117,22 @@ export default function Sales() {
             <div className="calc-panel">
               <div className="calc-row">
                 <span>Subtotal (selling price × quantity)</span>
-                <strong>{formatMoney(preview.subtotal)}</strong>
+                <strong>{formatMoneyRaw(preview.subtotal)}</strong>
               </div>
 
               <div className="calc-row">
                 <span>Discount</span>
                 <strong>
                   {preview.discount > 0
-                    ? `− ${formatMoney(preview.discount)}`
-                    : formatMoney(0)}
+                    ? `− ${formatMoneyRaw(preview.discount)}`
+                    : formatMoneyRaw(0)}
                 </strong>
               </div>
 
               <div className="calc-row">
                 <span>Final sale amount</span>
                 <strong className="money-pos">
-                  {formatMoney(preview.final)}
+                  {formatMoneyRaw(preview.final)}
                 </strong>
               </div>
 
@@ -1123,7 +1141,7 @@ export default function Sales() {
                 <strong
                   className={preview.due > 0 ? "money-neg" : undefined}
                 >
-                  {formatMoney(preview.due)}
+                  {formatMoneyRaw(preview.due)}
                 </strong>
               </div>
 

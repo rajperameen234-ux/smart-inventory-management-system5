@@ -29,6 +29,7 @@ import {
   LogOutIcon,
   MenuIcon,
   PanelLeftIcon,
+  RefreshIcon,
   SearchIcon,
   TagIcon,
   TruckIcon,
@@ -36,6 +37,12 @@ import {
   WalletIcon,
 } from "./Icon";
 import { useDismissable } from "./ui";
+import { useCurrency } from "./CurrencyProvider";
+import {
+  BASE_CURRENCY,
+  isCurrencyCode,
+  SUPPORTED_CURRENCIES,
+} from "../lib/currency";
 
 /* -------------------------------------------------------------------------- */
 /*  Brand mark                                                                 */
@@ -611,6 +618,77 @@ function NotificationBell({
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Currency switcher                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Global currency switcher. Changing it re-renders every financial figure in
+ * the app immediately (the CurrencyProvider owns the state); nothing here
+ * stores its own copy of the currency.
+ */
+function CurrencySwitcher() {
+  const {
+    currency,
+    setCurrency,
+    rateMissing,
+    rateStatus,
+    pkrPerUnit,
+    ratesLoading,
+    ratesError,
+    refreshRates,
+  } = useCurrency();
+
+  const tooltip = rateMissing
+    ? `No exchange rate for ${currency}${ratesError ? ` (${ratesError})` : ""} — amounts are shown in PKR until a rate is available.`
+    : currency === BASE_CURRENCY
+      ? "Display currency: PKR (base — no conversion)"
+      : `Display currency: ${currency} · 1 ${currency} = ${pkrPerUnit} PKR (${rateStatus === "manual" ? "manual rate" : "live rate"})`;
+
+  return (
+    <div
+      className={`topbar-currency${rateMissing ? " has-warning" : ""}`}
+      data-popover-anchor
+      title={tooltip}
+    >
+      {rateMissing ? (
+        <span className="topbar-currency-warning" aria-label="Exchange rate unavailable">
+          <AlertIcon size={14} />
+        </span>
+      ) : null}
+
+      <select
+        className="select topbar-currency-select"
+        value={currency}
+        onChange={(event) => {
+          if (isCurrencyCode(event.target.value)) {
+            setCurrency(event.target.value);
+          }
+        }}
+        aria-label="Display currency"
+      >
+        {SUPPORTED_CURRENCIES.map((info) => (
+          <option key={info.code} value={info.code}>
+            {info.code} · {info.prefix.trim()}
+          </option>
+        ))}
+      </select>
+
+      {rateMissing ? (
+        <button
+          type="button"
+          className="btn btn-sm btn-ghost"
+          onClick={() => void refreshRates()}
+          disabled={ratesLoading}
+          title="Fetch exchange rates"
+        >
+          <RefreshIcon size={13} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Profile menu                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -768,6 +846,8 @@ export default function AppShell({
           <div className="topbar-spacer" />
 
           <div className="topbar-actions">
+            <CurrencySwitcher />
+
             <GlobalSearch currentPage={currentPage} onNavigate={onNavigate} />
 
             <NotificationBell onNavigate={onNavigate} />

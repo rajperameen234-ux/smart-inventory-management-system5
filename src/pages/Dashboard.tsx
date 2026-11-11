@@ -38,6 +38,7 @@ import {
   toNumber,
 } from "../lib/format";
 import { formatDate } from "../lib/date";
+import { useCurrency } from "../components/CurrencyProvider";
 import {
   aggregateBy,
   computeLineTotals,
@@ -101,6 +102,9 @@ export default function Dashboard({
   onNavigate: (page: PageId) => void;
 }) {
   const toast = useToast();
+
+  /** Memos below render money into strings, so they track the display currency. */
+  const { currency, pkrPerUnit } = useCurrency();
 
   const [products, setProducts] = useState<ProductRow[]>([]);
   const [sales, setSales] = useState<SaleRow[]>([]);
@@ -353,7 +357,11 @@ export default function Dashboard({
         value: point.amount,
         hint: formatCompactMoney(point.amount),
       })),
-    [sales]
+    // Currency/rate belong here: the memo renders money into strings, so it
+    // must re-run when the display currency (or its rate) changes. The linter
+    // cannot see the module-level read inside formatCompactMoney.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional deps
+    [sales, currency, pkrPerUnit]
   );
 
   /** Today's and this month's billed sales totals. */
@@ -399,7 +407,10 @@ export default function Dashboard({
         ...entry,
         display: formatCompactMoney(entry.value),
       })),
-    [sales, productByIdNames, productById]
+    // Currency/rate belong here: the memo renders money into strings. The
+    // linter cannot see the module-level read inside formatCompactMoney.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional deps
+    [sales, productByIdNames, productById, currency, pkrPerUnit]
   );
 
   const recentPayments = useMemo(
@@ -431,7 +442,10 @@ const topProducts = useMemo(
         ...entry,
         display: formatCompactMoney(entry.value),
       })),
-    [sales, productByIdNames]
+    // Currency/rate belong here: the memo renders money into strings. The
+    // linter cannot see the module-level read inside formatCompactMoney.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional deps
+    [sales, productByIdNames, currency, pkrPerUnit]
   );
 
   const topCustomers = useMemo(
@@ -448,7 +462,10 @@ const topProducts = useMemo(
         ...entry,
         display: formatCompactMoney(entry.value),
       })),
-    [sales, customerByIdNames]
+    // Currency/rate belong here: the memo renders money into strings. The
+    // linter cannot see the module-level read inside formatCompactMoney.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional deps
+    [sales, customerByIdNames, currency, pkrPerUnit]
   );
 
   const recentSales = useMemo(

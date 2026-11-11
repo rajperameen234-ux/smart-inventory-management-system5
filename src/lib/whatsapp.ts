@@ -6,6 +6,12 @@
  * customer, sale, payment or dues data on its own.
  */
 
+import {
+  BASE_CURRENCY,
+  isValidRate,
+  SUPPORTED_CURRENCIES,
+} from "./currency.ts";
+
 /** The settings key written by the Settings page (`pages/Settings.tsx`). */
 const SETTINGS_KEY = "si.settings";
 
@@ -115,13 +121,45 @@ export type ReminderDetails = {
   outstandingDue: number;
 };
 
+/** The display currency the reminder should show (base amounts stay PKR). */
+export type ReminderCurrency = {
+  code: string;
+  /** PKR per one unit of `code`; ignored when the code is the base currency. */
+  pkrPerUnit: number | null;
+};
+
+const FALLBACK_PREFIX = "Rs.";
+
 /**
  * Build the default reminder message. Amounts are formatted here so the
  * rendered amounts cannot drift from the caller's calculations.
+ *
+ * `currency` is optional and defaults to the base currency (PKR) so existing
+ * callers and tests keep their behaviour; when a currency with a valid rate is
+ * passed, amounts are converted from PKR before formatting.
  */
-export function buildReminderMessage(details: ReminderDetails): string {
+export function buildReminderMessage(
+  details: ReminderDetails,
+  currency?: ReminderCurrency
+): string {
   const name = details.customerName.trim() || "Customer";
   const shop = details.businessName.trim() || DEFAULT_BUSINESS_FALLBACK;
+
+  let prefix = FALLBACK_PREFIX;
+  let rate = 1;
+
+  if (
+    currency &&
+    currency.code !== BASE_CURRENCY &&
+    isValidRate(currency.pkrPerUnit)
+  ) {
+    const info = SUPPORTED_CURRENCIES.find((item) => item.code === currency.code);
+
+    if (info) {
+      prefix = info.prefix;
+      rate = currency.pkrPerUnit as number;
+    }
+  }
 
   return [
     `Assalam-o-Alaikum ${name},`,
@@ -130,9 +168,9 @@ export function buildReminderMessage(details: ReminderDetails): string {
     "",
     "Your outstanding payment details:",
     "",
-    `Total Amount: Rs. ${formatMessageMoney(details.totalPurchases)}`,
-    `Paid Amount: Rs. ${formatMessageMoney(details.totalPaid)}`,
-    `Remaining Dues: Rs. ${formatMessageMoney(details.outstandingDue)}`,
+    `Total Amount: ${prefix} ${formatMessageMoney(details.totalPurchases / rate)}`,
+    `Paid Amount: ${prefix} ${formatMessageMoney(details.totalPaid / rate)}`,
+    `Remaining Dues: ${prefix} ${formatMessageMoney(details.outstandingDue / rate)}`,
     "",
     "Kindly clear your remaining balance at your convenience.",
     "",

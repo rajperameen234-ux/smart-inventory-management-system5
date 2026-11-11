@@ -30,7 +30,8 @@ import {
   StatCard,
   type BadgeTone,
 } from "../components/ui";
-import { formatDate, formatMoney, formatNumber, toNumber } from "../lib/format";
+import { formatDate, formatMoney, formatMoneyRaw, formatNumber, toNumber } from "../lib/format";
+import { useCurrency } from "../components/CurrencyProvider";
 import {
   mergeCategoryOptions,
   type CategoryRecord,
@@ -66,6 +67,14 @@ export default function Products({
   searchSeed?: string;
 }) {
   const toast = useToast();
+
+  /**
+   * Money inputs are typed in the SELECTED display currency and converted to
+   * the base currency (PKR) exactly once when saving; edit forms are seeded
+   * from the stored base amounts exactly once when opening. Nothing here
+   * converts a value twice.
+   */
+  const { currency, toPkr, toDisplay } = useCurrency();
 
   const [products, setProducts] = useState<Product[]>([]);
   const [search, setSearch] = useState(searchSeed);
@@ -254,8 +263,10 @@ export default function Products({
     setCategory(product.category);
     setSku(product.sku ?? "");
     setQuantity(String(product.quantity));
-    setPurchasePrice(String(product.purchasePrice));
-    setSellingPrice(String(product.sellingPrice));
+    // Stored base amounts are shown in the selected display currency, with
+    // enough precision to round-trip without corrupting the record.
+    setPurchasePrice(String(toDisplay(product.purchasePrice)));
+    setSellingPrice(String(toDisplay(product.sellingPrice)));
     setMinimumStock(String(product.minimumStock));
     setShowForm(true);
   };
@@ -341,14 +352,16 @@ export default function Products({
 
     setSaving(true);
 
+    // Convert the typed display amounts into the stored base currency (PKR)
+    // exactly once, right before anything touches the database.
     const stock = Number(quantity);
 
     const productDetails = {
       name: name.trim(),
       stock,
-      price: Number(sellingPrice),
+      price: toPkr(Number(sellingPrice)),
       supplier: category,
-      purchase_price: Number(purchasePrice),
+      purchase_price: toPkr(Number(purchasePrice)),
       sku: trimmedSku ? trimmedSku : null,
       minimum_stock: Math.max(0, Math.floor(Number(minimumStock) || 0)),
     };
@@ -469,7 +482,11 @@ export default function Products({
     });
   }, [products, search, categoryFilter, stockFilter]);
 
-  /** Live form previews: profit per unit and the automatic purchase total. */
+  /**
+   * Live form previews: profit per unit and the automatic purchase total.
+   * These are computed from the display-currency inputs, so they are already
+   * in display units — they must NOT be converted again, hence formatMoneyRaw.
+   */
   const profitPerUnitPreview = roundMoney(
     toNumber(sellingPrice) - toNumber(purchasePrice)
   );
@@ -890,7 +907,7 @@ export default function Products({
                 />
               </Field>
 
-              <Field label="Purchase price per unit (Rs.)" required>
+              <Field label={`Purchase price per unit (${currency})`} required>
                 <Input
                   type="number"
                   min="0"
@@ -903,7 +920,7 @@ export default function Products({
               </Field>
 
               <Field
-                label="Selling price per unit (Rs.)"
+                label={`Selling price per unit (${currency})`}
                 required
                 hint="The price shown to customers."
               >
@@ -922,12 +939,12 @@ export default function Products({
             <div className="calc-panel">
               <div className="calc-row">
                 <span>Profit per unit</span>
-                <strong>{formatMoney(profitPerUnitPreview)}</strong>
+                <strong>{formatMoneyRaw(profitPerUnitPreview)}</strong>
               </div>
 
               <div className="calc-row">
                 <span>Total purchase amount ({formatNumber(quantityTotal)} units)</span>
-                <strong>{formatMoney(totalPurchasePreview, 2)}</strong>
+                <strong>{formatMoneyRaw(totalPurchasePreview, 2)}</strong>
               </div>
 
               <p className="calc-note">

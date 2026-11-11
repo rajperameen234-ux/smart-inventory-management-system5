@@ -1,9 +1,12 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useToast } from "../components/Toast";
+import { useCurrency } from "../components/CurrencyProvider";
 import {
+  AlertIcon,
   CheckIcon,
   DatabaseIcon,
   LockIcon,
+  RefreshIcon,
   ShieldIcon,
   StoreIcon,
   WalletIcon,
@@ -22,6 +25,14 @@ import {
   Textarea,
 } from "../components/ui";
 import { formatDate } from "../lib/format";
+import {
+  BASE_CURRENCY,
+  isCurrencyCode,
+  SUPPORTED_CURRENCIES,
+  isValidRate,
+  resolvePkrPerUnit,
+  type CurrencyCode,
+} from "../lib/currency";
 import { supabase } from "../supabase";
 
 type StoredSettings = {
@@ -47,12 +58,31 @@ const DEFAULTS: StoredSettings = {
 export default function Settings() {
   const toast = useToast();
 
+  /**
+   * FIX: the currency selector used to keep its own local state here, so
+   * picking USD changed nothing outside this page. The selection now lives in
+   * the global CurrencyProvider and every financial figure in the app reads
+   * it — this page only displays and edits the shared value.
+   */
+  const {
+    currency,
+    setCurrency,
+    rates,
+    manualRates,
+    ratesUpdatedAt,
+    ratesError,
+    ratesLoading,
+    rateMissing,
+    refreshRates,
+    setManualRate,
+  } = useCurrency();
+
   const [businessName, setBusinessName] = useState(DEFAULTS.businessName);
   const [phone, setPhone] = useState(DEFAULTS.phone);
   const [address, setAddress] = useState(DEFAULTS.address);
-  const [currency, setCurrency] = useState(DEFAULTS.currency);
   const [lowStock, setLowStock] = useState(DEFAULTS.lowStock);
   const [notifications, setNotifications] = useState(DEFAULTS.notifications);
+  const [manualDrafts, setManualDrafts] = useState<Partial<Record<CurrencyCode, string>>>({});
 
   const [connection, setConnection] = useState<"idle" | "checking" | "ok" | "fail">(
     "idle"
@@ -73,7 +103,8 @@ export default function Settings() {
         setBusinessName(parsed.businessName ?? DEFAULTS.businessName);
         setPhone(parsed.phone ?? DEFAULTS.phone);
         setAddress(parsed.address ?? DEFAULTS.address);
-        setCurrency(parsed.currency ?? DEFAULTS.currency);
+        // The currency itself is owned by the global provider now; the legacy
+        // field is left in place for other readers (e.g. WhatsApp helpers).
         setLowStock(parsed.lowStock ?? DEFAULTS.lowStock);
         setNotifications(parsed.notifications ?? DEFAULTS.notifications);
       } catch {
@@ -96,7 +127,7 @@ export default function Settings() {
     setBusinessName(DEFAULTS.businessName);
     setPhone(DEFAULTS.phone);
     setAddress(DEFAULTS.address);
-    setCurrency(DEFAULTS.currency);
+    setCurrency(BASE_CURRENCY);
     setLowStock(DEFAULTS.lowStock);
     setNotifications(DEFAULTS.notifications);
 
@@ -110,6 +141,7 @@ export default function Settings() {
       businessName: businessName.trim(),
       phone: phone.trim(),
       address: address.trim(),
+      // Kept in sync so older readers of `si.settings` stay consistent.
       currency,
       lowStock,
       notifications,
@@ -117,7 +149,10 @@ export default function Settings() {
 
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 
-    toast.success("Settings saved", "Your preferences have been stored.");
+    toast.success(
+      "Settings saved",
+      `Display currency: ${currency}. Your preferences have been stored.`
+    );
   };
 
   async function checkConnection() {
@@ -135,6 +170,44 @@ export default function Settings() {
     setConnection("ok");
     setConnectionMessage("Connected to Supabase with row-level security active.");
     toast.success("Supabase connected successfully");
+  }
+
+  const tradableCurrencies = SUPPORTED_CURRENCIES.filter(
+    (info) => info.code !== BASE_CURRENCY
+  );
+
+  function commitManualRate(code: CurrencyCode) {
+    const draft = manualDrafts[code];
+
+    if (draft === undefined) return;
+
+    const trimmed = draft.trim();
+
+    if (trimmed === "") {
+      // Empty input clears the override so the fetched rate applies again.
+      setManualRate(code, null);
+      setManualDrafts((current) => {
+        const next = { ...current };
+        delete next[code];
+        return next;
+      });
+      toast.info("Manual rate cleared", `${code} uses the fetched rate again.`);
+      return;
+    }
+
+    const value = Number(trimmed);
+
+    if (!isValidRate(value)) {
+      toast.error(
+        "Invalid exchange rate",
+        `${trimmed} is not a valid rate. Enter how many PKR one ${code} is worth.`
+      );
+      return;
+    }
+
+    setManualRate(code, value);
+    setManualDrafts((current) => ({ ...current, [code]: "" }));
+    toast.success("Manual rate saved", `1 ${code} = ${value} PKR`);
   }
 
   return (
@@ -193,14 +266,29 @@ export default function Settings() {
 
               <CardBody>
                 <div className="form-grid">
-                  <Field label="Default currency">
+                  <Field
+                    label="Display currency"
+                    hint={
+                      currency === BASE_CURRENCY
+                        ? "Base currency — all records are stored in PKR."
+                        : rateMissing
+                          ? `No exchange rate for ${currency} — amounts stay in PKR until a rate is available.`
+                          : `All amounts are shown in ${currency} using the current exchange rate.`
+                    }
+                  >
                     <Select
                       value={currency}
-                      onChange={(event) => setCurrency(event.target.value)}
+                      onChange={(event) => {
+                        if (isCurrencyCode(event.target.value)) {
+                          setCurrency(event.target.value);
+                        }
+                      }}
                     >
-                      <option value="PKR">PKR - Pakistani Rupee</option>
-                      <option value="USD">USD - US Dollar</option>
-                      <option value="AED">AED - UAE Dirham</option>
+                      {SUPPORTED_CURRENCIES.map((info) => (
+                        <option key={info.code} value={info.code}>
+                          {info.label}
+                        </option>
+                      ))}
                     </Select>
                   </Field>
 
@@ -280,6 +368,133 @@ export default function Settings() {
             </div>
           </PageStack>
         </form>
+
+        <Card>
+          <CardHeader
+            title="Exchange rates"
+            description={`Base currency ${BASE_CURRENCY} · fetched rates update automatically, manual rates always win`}
+            actions={
+              <Button
+                variant="secondary"
+                onClick={() => void refreshRates()}
+                disabled={ratesLoading}
+              >
+                <RefreshIcon size={15} />
+                {ratesLoading ? "Fetching..." : "Refresh rates"}
+              </Button>
+            }
+          />
+
+          <CardBody>
+            {ratesError ? (
+              <div className="alert alert-warning" role="status">
+                <AlertIcon size={16} />
+                <div className="alert-content">
+                  <strong>Exchange rates could not be fetched</strong>
+                  {ratesError} Set a manual rate below so the selected currency
+                  can still be displayed correctly.
+                </div>
+              </div>
+            ) : null}
+
+            {rateMissing ? (
+              <div className="alert alert-error" role="alert">
+                <AlertIcon size={16} />
+                <div className="alert-content">
+                  <strong>No exchange rate for {currency}</strong>
+                  Amounts are shown in PKR while this persists. Fetch rates or
+                  enter a manual rate below — the display currency is never
+                  silently faked.
+                </div>
+              </div>
+            ) : null}
+
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Currency</th>
+                    <th className="num">Fetched rate (PKR per 1)</th>
+                    <th className="num">Manual rate (PKR per 1)</th>
+                    <th className="num">Effective</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {tradableCurrencies.map((info) => {
+                    const fetched = rates[info.code];
+                    const manual = manualRates[info.code];
+                    const effective = resolvePkrPerUnit(
+                      info.code,
+                      rates,
+                      manualRates
+                    );
+
+                    return (
+                      <tr key={info.code}>
+                        <td className="cell-primary">{info.label}</td>
+
+                        <td className="num">
+                          {isValidRate(fetched) ? fetched : <span className="cell-muted">—</span>}
+                        </td>
+
+                        <td className="num">
+                          <Input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            placeholder={
+                              isValidRate(fetched) ? String(fetched) : "e.g. 278.50"
+                            }
+                            value={manualDrafts[info.code] ?? ""}
+                            onChange={(event) =>
+                              setManualDrafts((current) => ({
+                                ...current,
+                                [info.code]: event.target.value,
+                              }))
+                            }
+                            onBlur={() => commitManualRate(info.code)}
+                            aria-label={`Manual exchange rate for ${info.code}`}
+                            style={{ width: 140 }}
+                          />
+                        </td>
+
+                        <td className="num cell-strong">
+                          {effective !== null ? (
+                            effective
+                          ) : (
+                            <span className="money-neg">unavailable</span>
+                          )}
+                        </td>
+
+                        <td>
+                          {manual !== undefined ? (
+                            <Badge tone="lavender">Manual</Badge>
+                          ) : isValidRate(fetched) ? (
+                            <Badge tone="success">Live</Badge>
+                          ) : (
+                            <Badge tone="yellow">Missing</Badge>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <p className="calc-note">
+              {ratesUpdatedAt
+                ? `Last fetched ${formatDate(new Date(ratesUpdatedAt).toISOString().slice(0, 10))}. `
+                : "Rates have never been fetched. "}
+              A manual rate overrides the fetched one for that currency only;
+              leave the field empty to use the live rate again. Amounts are
+              stored in PKR and converted for display, so changing these rates
+              never rewrites your records.
+            </p>
+          </CardBody>
+        </Card>
 
         <Card>
           <CardHeader

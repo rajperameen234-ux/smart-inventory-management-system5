@@ -35,7 +35,8 @@ import {
   Textarea,
   type BadgeTone,
 } from "../components/ui";
-import { formatDate, formatMoney, formatNumber, toDateInputValue, todayISODate } from "../lib/format";
+import { formatDate, formatMoney, formatMoneyRaw, formatNumber, toDateInputValue, todayISODate } from "../lib/format";
+import { useCurrency } from "../components/CurrencyProvider";
 import {
   computeDueStatus,
   resolveName,
@@ -130,6 +131,13 @@ type ReminderTotals = {
 
 export default function CreditDues() {
   const toast = useToast();
+
+  /**
+   * Money inputs are typed in the SELECTED display currency and converted to
+   * the base currency (PKR) exactly once when saving; edit forms are seeded
+   * from the stored base amounts exactly once when opening.
+   */
+  const { currency, toPkr, toDisplay, pkrPerUnit, rateMissing } = useCurrency();
 
   const [customers, setCustomers] = useState<CustomerDue[]>([]);
   const [customerRefs, setCustomerRefs] = useState<CustomerRef[]>([]);
@@ -338,9 +346,14 @@ export default function CreditDues() {
     setPaymentsBusy(false);
   };
 
+  /**
+   * The outstanding balance in DISPLAY units: the stored base amount is
+   * converted once, then the typed payment (already display units) is
+   * subtracted directly.
+   */
   const paymentRemainingPreview = Math.max(
     0,
-    roundMoney(paymentTargetOutstanding - (Number(paymentAmount) || 0))
+    roundMoney(toDisplay(paymentTargetOutstanding) - (Number(paymentAmount) || 0))
   );
 
   const recordPayment = async (event: FormEvent<HTMLFormElement>) => {
@@ -352,20 +365,27 @@ export default function CreditDues() {
 
     if (!target) return;
 
+    // The typed amount is in the selected display currency; the outstanding
+    // balance is stored in base (PKR), so compare in display units.
     const amount = roundMoney(Number(paymentAmount) || 0);
+    const outstandingDisplay = toDisplay(paymentTargetOutstanding);
 
     if (!paymentAmount.trim() || !Number.isFinite(Number(paymentAmount)) || amount <= 0) {
       toast.error("Check the payment", "Enter a payment amount greater than 0.");
       return;
     }
 
-    if (amount > paymentTargetOutstanding) {
+    if (amount > outstandingDisplay) {
       toast.error(
         "Payment too high",
-        `Received Rs. ${amount.toLocaleString()} exceeds the outstanding balance of Rs. ${paymentTargetOutstanding.toLocaleString()}.`
+        `Received ${formatMoneyRaw(amount)} exceeds the outstanding balance of ${formatMoneyRaw(outstandingDisplay)}.`
       );
       return;
     }
+
+    // Convert to the stored base currency (PKR) exactly once, before any
+    // database call sees the value.
+    const amountBase = toPkr(amount);
 
     if (!paymentDate || !toDateInputValue(paymentDate)) {
       toast.error("Check the payment", "Select the payment date.");
@@ -384,7 +404,7 @@ export default function CreditDues() {
         "record_customer_payment",
         {
           p_customer_id: target.id,
-          p_amount: amount,
+          p_amount: amountBase,
           p_paid_at: toDateInputValue(paymentDate),
           p_note: paymentNote.trim() ? paymentNote.trim() : null,
         }
@@ -401,7 +421,13 @@ export default function CreditDues() {
         console.warn(
           "record_customer_payment unavailable — falling back to client-side allocation."
         );
-        await recordPaymentFallback(target, amount, paymentDate, paymentNote);
+        await recordPaymentFallback(
+          target,
+          amountBase,
+          amount,
+          paymentDate,
+          paymentNote
+        );
       } else {
         const applied = rpcData as { unallocated?: number } | null;
 
@@ -411,7 +437,10 @@ export default function CreditDues() {
             "Some of the payment could not be matched to an open sale. Balances were checked — refresh to confirm."
           );
         } else {
-          toast.success("Payment recorded", `${target.name} paid Rs. ${amount.toLocaleString()}`);
+          toast.success(
+            "Payment recorded",
+            `${target.name} paid ${formatMoneyRaw(amount)}`
+          );
         }
       }
 
@@ -430,11 +459,14 @@ export default function CreditDues() {
   /**
    * Client-side FIFO fallback used only when the database function has not
    * been migrated yet. Each sale update is verified so partial progress is
-   * always reported rather than silently claimed.
+   * always reported rather than silently claimed. `amountBase` is in the
+   * stored base currency; `displayAmount` is what the user typed, kept only
+   * for the confirmation toast.
    */
   const recordPaymentFallback = async (
     target: CustomerDue,
-    amount: number,
+    amountBase: number,
+    displayAmount: number,
     paymentDate: string,
     note: string
   ) => {
@@ -460,7 +492,7 @@ export default function CreditDues() {
           toNumber(row.total_amount) - toNumber(row.paid_amount)
         ),
       })),
-      amount
+      amountBase
     );
 
     if (allocation.applications.length === 0 || allocation.unallocated > 0.009) {
@@ -529,7 +561,10 @@ export default function CreditDues() {
       return;
     }
 
-    toast.success("Payment recorded", `${target.name} paid Rs. ${amount.toLocaleString()}`);
+    toast.success(
+      "Payment recorded",
+      `${target.name} paid ${formatMoneyRaw(displayAmount)}`
+    );
     setPaymentsBusy(false);
   };
 
@@ -547,8 +582,10 @@ export default function CreditDues() {
   const openLegacyEditForm = (due: Due) => {
     setEditingId(due.id);
     setLegacyCustomerId(due.customerId.toString());
-    setTotalDue(due.totalDue.toString());
-    setLegacyPaidAmount(due.paidAmount.toString());
+    // Stored base amounts are shown in the selected display currency, with
+    // enough precision to round-trip without corrupting the record.
+    setTotalDue(String(toDisplay(due.totalDue)));
+    setLegacyPaidAmount(String(toDisplay(due.paidAmount)));
     // Normalised so a stored timestamp cannot render as an empty date field.
     setDueDate(toDateInputValue(due.dueDate));
     setShowForm(true);
@@ -565,6 +602,8 @@ export default function CreditDues() {
 
     if (saving) return;
 
+    // Validate in display units (what the user sees), then convert to the
+    // stored base currency (PKR) exactly once before touching the database.
     const issues = validateDue({
       customerId: legacyCustomerId,
       totalDue,
@@ -577,8 +616,13 @@ export default function CreditDues() {
       return;
     }
 
-    const total = toNumber(totalDue);
-    const paid = toNumber(paidAmount);
+    const total = toPkr(toNumber(totalDue));
+    // The paid amount can never exceed the total; clamping also guards the
+    // theoretical corner where currency rounding moves it by a fraction.
+    const paid = Math.min(
+      toPkr(toNumber(paidAmount)),
+      toPkr(toNumber(totalDue))
+    );
     const remaining = roundMoney(Math.max(0, total - paid));
     const status = computeDueStatus(total, paid);
 
@@ -693,13 +737,16 @@ export default function CreditDues() {
   const openReminder = async (customer: CustomerDue) => {
     const businessName = getBusinessName();
 
-    const seedMessage = buildReminderMessage({
-      customerName: customer.name,
-      businessName,
-      totalPurchases: customer.totalPurchases,
-      totalPaid: customer.totalPaid,
-      outstandingDue: customer.outstandingDue,
-    });
+    const seedMessage = buildReminderMessage(
+      {
+        customerName: customer.name,
+        businessName,
+        totalPurchases: customer.totalPurchases,
+        totalPaid: customer.totalPaid,
+        outstandingDue: customer.outstandingDue,
+      },
+      { code: currency, pkrPerUnit: rateMissing ? null : pkrPerUnit }
+    );
 
     const digits = normalizePakistaniPhone(customer.phone);
 
@@ -754,11 +801,14 @@ export default function CreditDues() {
     const latestPhone = String(customerResult.data?.phone ?? customer.phone);
     const latestDigits = normalizePakistaniPhone(latestPhone);
     const latestTotals = aggregateSales(salesResult.data ?? []);
-    const latestMessage = buildReminderMessage({
-      customerName: latestName,
-      businessName,
-      ...latestTotals,
-    });
+    const latestMessage = buildReminderMessage(
+      {
+        customerName: latestName,
+        businessName,
+        ...latestTotals,
+      },
+      { code: currency, pkrPerUnit: rateMissing ? null : pkrPerUnit }
+    );
 
     setReminder((current) => {
       if (!current || current.id !== customer.id) return current;
@@ -796,13 +846,16 @@ export default function CreditDues() {
         ? {
             ...current,
             messageDirty: false,
-            message: buildReminderMessage({
-              customerName: current.name,
-              businessName: getBusinessName(),
-              totalPurchases: current.totalPurchases,
-              totalPaid: current.totalPaid,
-              outstandingDue: current.outstandingDue,
-            }),
+            message: buildReminderMessage(
+              {
+                customerName: current.name,
+                businessName: getBusinessName(),
+                totalPurchases: current.totalPurchases,
+                totalPaid: current.totalPaid,
+                outstandingDue: current.outstandingDue,
+              },
+              { code: currency, pkrPerUnit: rateMissing ? null : pkrPerUnit }
+            ),
           }
         : current
     );
@@ -1261,13 +1314,13 @@ export default function CreditDues() {
                   <strong
                     className={paymentRemainingPreview > 0 ? "money-neg" : "money-pos"}
                   >
-                    {formatMoney(paymentRemainingPreview)}
+                    {formatMoneyRaw(paymentRemainingPreview)}
                   </strong>
                 </div>
               </div>
 
               <div className="form-grid">
-                <Field label="Payment amount (Rs.)" required>
+                <Field label={`Payment amount (${currency})`} required>
                   <Input
                     type="number"
                     min="0"
@@ -1582,28 +1635,28 @@ export default function CreditDues() {
                 </Select>
               </Field>
 
-              <Field label="Total due (Rs.)" required>
-                <Input
-                  type="number"
-                  min="0"
-                  placeholder="0.00"
-                  value={totalDue}
-                  onChange={(event) => setTotalDue(event.target.value)}
-                />
-              </Field>
+                <Field label={`Total due (${currency})`} required>
+                  <Input
+                    type="number"
+                    min="0"
+                    placeholder="0.00"
+                    value={totalDue}
+                    onChange={(event) => setTotalDue(event.target.value)}
+                  />
+                </Field>
 
-              <Field
-                label="Paid amount (Rs.)"
-                hint={`Remaining: ${formatMoney(previewRemaining)}`}
-              >
-                <Input
-                  type="number"
-                  min="0"
-                  placeholder="0.00"
-                  value={paidAmount}
-                  onChange={(event) => setLegacyPaidAmount(event.target.value)}
-                />
-              </Field>
+                <Field
+                  label={`Paid amount (${currency})`}
+                  hint={`Remaining: ${formatMoneyRaw(previewRemaining)}`}
+                >
+                  <Input
+                    type="number"
+                    min="0"
+                    placeholder="0.00"
+                    value={paidAmount}
+                    onChange={(event) => setLegacyPaidAmount(event.target.value)}
+                  />
+                </Field>
 
               <Field label="Due date" required>
                 <span style={{ position: "relative", display: "block" }}>

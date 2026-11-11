@@ -27,6 +27,7 @@ import {
 } from "../components/ui";
 import { buildMonthlySeries, formatCompactMoney, formatMoney, formatNumber } from "../lib/format";
 import { formatDate } from "../lib/date";
+import { useCurrency } from "../components/CurrencyProvider";
 import {
   aggregateBy,
   computeLineTotals,
@@ -49,6 +50,9 @@ type ReportSale = {
 
 export default function Reports() {
   const toast = useToast();
+
+  /** Memos below render money into strings, so they track the display currency. */
+  const { currency, pkrPerUnit } = useCurrency();
 
   const [sales, setSales] = useState<ReportSale[]>([]);
   const [search, setSearch] = useState("");
@@ -165,7 +169,10 @@ export default function Reports() {
         ...entry,
         display: formatCompactMoney(entry.value),
       })),
-    [sales]
+    // Currency/rate belong here: the memo renders money into strings. The
+    // linter cannot see the module-level read inside formatCompactMoney.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional deps
+    [sales, currency, pkrPerUnit]
   );
 
   const topCustomers = useMemo(
@@ -177,7 +184,10 @@ export default function Reports() {
         ...entry,
         display: formatCompactMoney(entry.value),
       })),
-    [sales]
+    // Currency/rate belong here: the memo renders money into strings. The
+    // linter cannot see the module-level read inside formatCompactMoney.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional deps
+    [sales, currency, pkrPerUnit]
   );
 
   const filteredSales = useMemo(() => {
